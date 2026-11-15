@@ -1,0 +1,14 @@
+# build output (release copies live in discs/ and web/jsbeeb/discs/)
+build/
+screenshots/
+# corpora are never committed: the stand-in is downloaded by tools/get_standin.sh,
+# and your own book (corpus/hhgttg.txt or any other) stays on your machine
+corpus/*.txt
+corpus/*.pdf
+corpus/*.epub
+# node / python / editor junk
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+*.swp

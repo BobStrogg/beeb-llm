@@ -1,0 +1,1094 @@
+\ ============================================================================
+\  BEEB-LLM: a character-level transformer language model for the BBC Micro
+\  Model B (6502 @ 2MHz, 32K, OS 1.20), running in MODE 7.
+\
+\  Pure integer inference, bit-exact with tools/intref.py:
+\    * int8 weights and activations, 16-bit accumulators
+\    * 8x8 signed multiply from a quarter-square table: a*w = f(a+w) - f(w-a),
+\      f(n) = n*n/4, 512-entry table at &0900-&0CFF (low bytes / high bytes)
+\    * table RMSNorm, table exp() softmax, multi-query attention over a ring
+\      buffer KV cache (sliding window of CTX characters), ReLU MLP
+\    * temperature + top-k sampling from a xorshift16 generator
+\  Assemble with BeebAsm (see build.sh).
+\ ============================================================================
+
+INCLUDE "../build/model_consts.6502"
+ASSERT D = 32 AND HD = 8 AND NH * HD = D AND (CTX = 32 OR CTX = 64)
+
+OSWRCH = &FFEE : OSBYTE = &FFF4 : OSWORD = &FFF1 : OSRDCH = &FFE0 : OSNEWL = &FFE7
+
+\ ---- quarter-square table: f(n) for n = -256..255
+SQL = &0900          \ low bytes, f(n) at &0A00+n
+SQH = &0B00          \ high bytes, f(n) at &0C00+n
+
+\ ---- zero page (BASIC's &00-&7F is saved on entry and put back on exit)
+ACCL = &00           \ 64 accumulators, low bytes
+ACCH = &40           \ ... high bytes
+PL = &80 : PH = &82 : QL = &84 : QH = &86     \ multiply pointers (high bytes fixed)
+TL = &88
+ZA = &89 : ZB = &8A : ZC = &8B : ZD = &8C
+SCR = &8D            \ 2-byte screen pointer
+ZE = &8F
+
+SCREEN = &7C00
+WTOP = 4 : WBOT = 22 \ text window rows (columns 1..39; column 0 holds the colour)
+HDR_COLOUR = &83
+
+ORG &1900
+GUARD &7C00
+
+.start
+    JMP main
+
+\ ---- screen text (defined early: macro arguments cannot be forward references)
+.s_title EQUB &84, &9D, &83, &8D : EQUS "            DON'T PANIC             ", 0
+.s_sub   EQUB &86 : EQUS "BEEB-LLM", &87, '0' + NPARAMS_K DIV 10, '0' + NPARAMS_K MOD 10
+         EQUS "K-param transformer, 6502", 0
+.s_status EQUB &83 : EQUS "Temp 0.0 ", &82 : EQUS "Top-k --", &86 : EQUS "0.00 tok/s", &85 : EQUS "        ", 0
+.s_paused EQUB &81 : EQUS "PAUSED", 0
+.s_help  EQUB &86 : EQUS "SPACE", &87 : EQUS "new", &86 : EQUS "< >", &87 : EQUS "temperature", &86 : EQUS "K", &87 : EQUS "top-k", 0
+.s_idle  EQUB &82 : EQUS "RETURN prompt  P pause  Q quit         ", 0
+.s_prompt EQUB &83 : EQUS "> ", &87 : EQUS "                                     ", 0
+
+
+\ ============================================================================
+\  multiply / accumulate core
+\ ============================================================================
+
+\ set the four table pointers for multiplier A (-127..127, not 0)
+MACRO SETPTR
+    EOR #&80
+    STA PL : STA PH
+    EOR #&FF : CLC : ADC #1
+    STA QL : STA QH
+ENDMACRO
+
+\ colmac: ACC[X..0] += A * W[X..0]   (W at colw, biased +128); A != 0
+.colmac
+    SETPTR
+.colmac_p
+.colw LDY &FFFF,X
+    LDA (PL),Y
+    SEC
+    SBC (QL),Y
+    STA TL
+    LDA (PH),Y
+    SBC (QH),Y
+    TAY
+    LDA TL
+    CLC
+    ADC ACCL,X
+    STA ACCL,X
+    TYA
+    ADC ACCH,X
+    STA ACCH,X
+    DEX
+    BPL colw
+    RTS
+
+\ matvec: ACC[0..mv_rows-1] = bias + W * x
+\   mv_w (weights, column-major), mv_b (bias lo; hi follows), mv_x (input), mv_rows, mv_cols
+.matvec
+{
+    LDA mv_b : STA bl+1 : LDA mv_b+1 : STA bl+2
+    LDA mv_b : CLC : ADC mv_rows : STA bh+1
+    LDA mv_b+1 : ADC #0 : STA bh+2
+    LDX mv_rows : DEX
+.bl LDA &FFFF,X : STA ACCL,X
+.bh LDA &FFFF,X : STA ACCH,X
+    DEX : BPL bl
+    LDA mv_w : STA colw+1 : LDA mv_w+1 : STA colw+2
+    LDA mv_x : STA xin+1 : LDA mv_x+1 : STA xin+2
+    LDA #0 : STA mv_j
+.col
+    LDY mv_j
+.xin LDA &FFFF,Y
+    BEQ skip
+    LDX mv_rows : DEX
+    JSR colmac
+.skip
+    LDA colw+1 : CLC : ADC mv_rows : STA colw+1
+    BCC nc : INC colw+2
+.nc INC mv_j
+    LDA mv_j : CMP mv_cols : BNE col
+    RTS
+}
+
+\ mul8: (ZA signed, -128..127) * (A, 1..127) -> TL (lo), A (hi)
+.mul8
+    SETPTR
+    LDA ZA : EOR #&80 : TAY
+    LDA (PL),Y : SEC : SBC (QL),Y : STA TL
+    LDA (PH),Y : SBC (QH),Y
+    RTS
+
+\ asr: arithmetic shift right of ZA (lo) / ZB (hi) by Y (0..15)
+.asr
+{
+    CPY #8 : BCC lt8
+    LDA ZB : STA ZA
+    LDA #0 : BIT ZB : BPL p : LDA #&FF
+.p  STA ZB
+    TYA : SEC : SBC #8 : TAY
+.lt8
+    CPY #5 : BCS left
+    CPY #0 : BEQ done
+.loop
+    LDA ZB : CMP #&80 : ROR ZB : ROR ZA
+    DEY : BNE loop
+.done
+    RTS
+.left                      \ 5..7: shift left 8-Y into a sign byte, keep the top two bytes
+    LDA #0 : BIT ZB : BPL lp : LDA #&FF
+.lp STA TL
+    TYA : EOR #7 : TAY : INY      \ 8 - Y
+.ll ASL ZA : ROL ZB : ROL TL : DEY : BNE ll
+    LDA ZB : STA ZA : LDA TL : STA ZB
+    RTS
+}
+
+\ clamp ZB:ZA to -127..127 (or 0..127 when rq_lo = 0) -> A
+.clamp
+{
+    LDA ZB : BEQ pos : CMP #&FF : BEQ neg
+    LDA ZB : BMI lo
+.hi LDA #127 : RTS
+.pos LDA ZA : BMI hi : RTS
+.neg LDA ZA : CMP #&81 : BCC lo
+    BIT rq_lo : BPL lo     \ rq_lo = 0 -> relu
+    RTS
+.lo LDA rq_lo : RTS        \ &81 (-127) or 0
+}
+
+\ requant: dst[i] = clamp(ACC[src+i] >> rq_s) for i < rq_n
+.requant
+{
+    LDA rq_dst : STA st+1 : LDA rq_dst+1 : STA st+2
+    LDX rq_src : LDA #0 : STA rq_i
+.lp LDA ACCL,X : STA ZA : LDA ACCH,X : STA ZB
+    LDY rq_s : JSR asr
+    JSR clamp
+    LDY rq_i
+.st STA &FFFF,Y
+    INX : INC rq_i : LDA rq_i : CMP rq_n : BNE lp
+    RTS
+}
+
+\ resadd: R[i] += ACC[i] >> rs (rs signed: negative = shift left)
+.resadd
+{
+    LDX #D-1
+.lp LDA ACCL,X : STA ZA : LDA ACCH,X : STA ZB
+    LDA rs : BMI left
+    TAY : JSR asr : JMP add
+.left EOR #&FF : CLC : ADC #1 : TAY
+.sl ASL ZA : ROL ZB : DEY : BNE sl
+.add CLC : LDA RL,X : ADC ZA : STA RL,X
+    LDA RH,X : ADC ZB : STA RH,X
+    DEX : BPL lp
+    RTS
+}
+
+\ ============================================================================
+\  RMSNorm: X8 = norm(R)   (see IntModel.norm)
+\ ============================================================================
+.norm
+{
+    \ max |R|
+    LDA #0 : STA ZC : STA ZD
+    LDX #D-1
+.mx LDA RL,X : STA ZA : LDA RH,X : STA ZB
+    BPL p
+    SEC : LDA #0 : SBC ZA : STA ZA : LDA #0 : SBC ZB : STA ZB
+.p  LDA ZA : CMP ZC : LDA ZB : SBC ZD : BCC nb
+    LDA ZA : STA ZC : LDA ZB : STA ZD
+.nb DEX : BPL mx
+    \ ZD:ZC = mx (0..32768, unsigned)
+    LDA ZD : BNE big
+    LDA ZC : BMI big
+    BNE small
+    \ all zero -> X8 = 0
+    LDX #D-1 : LDA #0
+.z  STA X8,X : DEX : BPL z
+    RTS
+.big
+    LDY #0
+.bs INY : LSR ZD : ROR ZC
+    LDA ZD : BNE bs : LDA ZC : BMI bs
+    STY ZE                  \ shift right by ZE
+    LDX #D-1
+.bx LDA RL,X : STA ZA : LDA RH,X : STA ZB
+    LDY ZE : JSR asr
+    LDA ZA : STA X8,X
+    DEX : BPL bx
+    JMP sumsq
+.small
+    LDY #0 : LDA ZC
+.ss CMP #64 : BCS sd : ASL A : INY : BNE ss
+.sd STY ZE
+    LDX #D-1
+.sx LDA RL,X : LDY ZE : BEQ sn
+.sy ASL A : DEY : BNE sy
+.sn STA X8,X : DEX : BPL sx
+.sumsq
+    \ ss = sum x8^2  (24-bit in ZA ZB ZC), using f(2x) = x^2
+    LDA #0 : STA ZA : STA ZB : STA ZC
+    LDX #D-1
+.q  LDA X8,X : ASL A : TAY
+    BCS qn
+    LDA SQL+&100,Y : CLC : ADC ZA : STA ZA
+    LDA SQH+&100,Y : ADC ZB : STA ZB
+    BCC qd : INC ZC : BCS qd
+.qn LDA SQL,Y : CLC : ADC ZA : STA ZA
+    LDA SQH,Y : ADC ZB : STA ZB
+    BCC qd : INC ZC
+.qd DEX : BPL q
+    \ normalise: while ss >= 256: ss >>= 2, e++
+    LDY #NK
+.ne LDA ZB : ORA ZC : BEQ nd
+    LSR ZC : ROR ZB : ROR ZA
+    LSR ZC : ROR ZB : ROR ZA
+    INY : BNE ne
+.nd STY nm_sh
+    LDX ZA : LDA rtab-64,X : STA nm_r
+    \ rounding constant 1 << (sh-1)
+    LDA #0 : STA nm_rl : STA nm_rh
+    DEY : TYA : CMP #8 : BCS rh
+    TAX : LDA #1
+.rl CPX #0 : BEQ rl2 : ASL A : DEX : BNE rl
+.rl2 STA nm_rl : JMP rd
+.rh SEC : SBC #8 : TAX : LDA #1
+.rh1 CPX #0 : BEQ rh2 : ASL A : DEX : BNE rh1
+.rh2 STA nm_rh
+.rd
+    LDA #&81 : STA rq_lo
+    LDX #D-1
+.y  STX ZE
+    LDA X8,X : STA ZA
+    LDA nm_r : JSR mul8
+    STA ZB
+    CLC : LDA TL : ADC nm_rl : STA ZA
+    LDA ZB : ADC nm_rh : STA ZB
+    LDY nm_sh : JSR asr
+    JSR clamp
+    LDX ZE : STA X8,X
+    DEX : BPL y
+    RTS
+}
+
+\ ============================================================================
+\  attention for the current layer: OB = attend(QB, cache)
+\ ============================================================================
+.attention
+{
+    \ ---- store K, V (biased +128) at this slot
+    LDA ly_kc : STA kp : LDA ly_kc+1 : STA kp+1
+    LDA ly_vc : STA vp : LDA ly_vc+1 : STA vp+1
+    LDX #0
+.st LDA kp : CLC : ADC slot : STA ks+1 : LDA kp+1 : ADC #0 : STA ks+2
+    LDA vp : CLC : ADC slot : STA vs+1 : LDA vp+1 : ADC #0 : STA vs+2
+    LDA KB,X : EOR #&80
+.ks STA &FFFF
+    LDA VB,X : EOR #&80
+.vs STA &FFFF
+    LDA kp : CLC : ADC #CTX : STA kp : BCC s1 : INC kp+1
+.s1 LDA vp : CLC : ADC #CTX : STA vp : BCC s2 : INC vp+1
+.s2 INX : CPX #HD : BNE st
+    \ ---- patch the 8 V-column loads for this layer
+    LDA ly_vc : STA vp : LDA ly_vc+1 : STA vp+1
+    LDX #0
+.pv LDA vpatch_lo,X : STA ZA : LDA vpatch_hi,X : STA ZB
+    LDY #1 : LDA vp : STA (ZA),Y : INY : LDA vp+1 : STA (ZA),Y
+    LDA vp : CLC : ADC #CTX : STA vp : BCC pv1 : INC vp+1
+.pv1 INX : CPX #HD : BNE pv
+    LDA #0 : STA head
+.headlp
+    \ ---- scores: ACC[t] = sum_j q[h,j] * K[t,j]
+    LDX nvis : DEX : LDA #0
+.za STA ACCL,X : STA ACCH,X : DEX : BPL za
+    LDA ly_kc : STA colw+1 : LDA ly_kc+1 : STA colw+2
+    LDA head : ASL A : ASL A : ASL A : STA qj     \ head*HD
+    LDA #HD : STA jcnt
+.qk LDX qj : LDA QB,X : BEQ qk0
+    LDX nvis : DEX
+    JSR colmac
+.qk0 LDA colw+1 : CLC : ADC #CTX : STA colw+1 : BCC qk1 : INC colw+2
+.qk1 INC qj : DEC jcnt : BNE qk
+    \ ---- s = (acc >> SQK) - rb[h][(slot - t) & (CTX-1)], track max
+    LDA head : ASL A : ASL A : ASL A : ASL A : ASL A   \ head*CTX (CTX = 32)
+IF CTX = 64
+    ASL A
+ENDIF
+    CLC : ADC ly_rb : STA rbp+1 : LDA ly_rb+1 : ADC #0 : STA rbp+2
+    LDA #&00 : STA mxl : LDA #&80 : STA mxh   \ -32768
+    LDX nvis : DEX
+.sc STX ZE
+    LDA ACCL,X : STA ZA : LDA ACCH,X : STA ZB
+    LDY ly_sqk : JSR asr
+    LDA slot : SEC : SBC ZE : AND #CTX-1 : TAY
+.rbp LDA &FFFF,Y
+    STA ZC : LDA #0 : BIT ZC : BPL rb1 : LDA #&FF
+.rb1 STA ZD
+    LDX ZE
+    SEC : LDA ZA : SBC ZC : STA ACCL,X
+    LDA ZB : SBC ZD : STA ACCH,X
+    \ signed compare with max
+    LDA ACCL,X : CMP mxl : LDA ACCH,X : SBC mxh
+    BVC sv : EOR #&80
+.sv BMI sm
+    LDA ACCL,X : STA mxl : LDA ACCH,X : STA mxh
+.sm DEX : BPL sc
+    \ ---- e[t] = EXP[max - s], E = sum e
+    LDA #0 : STA esl : STA esh
+    LDX nvis : DEX
+.ex SEC : LDA mxl : SBC ACCL,X : TAY : LDA mxh : SBC ACCH,X
+    BNE e0 : CPY #EXP_LEN : BCS e0
+    LDA exptab,Y : JMP e1
+.e0 LDA #0
+.e1 STA EB,X
+    CLC : ADC esl : STA esl : BCC e2 : INC esh
+.e2 DEX : BPL ex
+    \ ---- N[j] = sum_t e[t] * V[t,j] + cnt*32768   (24-bit, each term biased +32768)
+    LDX #3*HD-1 : LDA #0
+.zn STA NACC,X : DEX : BPL zn
+    STA cntl : STA cnth
+    LDX nvis : DEX
+.vt LDA EB,X : BNE vgo : JMP vnext
+.vgo SETPTR
+    INC cntl : BNE vc0 : INC cnth
+.vc0
+FOR j, 0, HD-1
+.vld LDY &FFFF,X
+    LDA (PL),Y : SEC : SBC (QL),Y : STA TL
+    LDA (PH),Y : SBC (QH),Y : EOR #&80 : TAY
+    LDA TL : CLC : ADC NACC+j : STA NACC+j
+    TYA : ADC NACC+HD+j : STA NACC+HD+j
+    BCC P% + 5 : INC NACC+2*HD+j
+NEXT
+.vnext DEX : BMI vdone : JMP vt
+VBLK = (vnext - vc0) DIV HD
+.vdone
+    \ ---- subtract cnt*32768: mid -= (cnt&1)<<7, hi -= cnt>>1
+    LDA cntl : LSR cnth : ROR A : STA cnth    \ cnth = cnt >> 1 (cnt <= 64)
+    LDA #0 : ROR A : STA cntl                \ (cnt & 1) << 7
+    LDX #HD-1
+.sb SEC : LDA NACC+HD,X : SBC cntl : STA NACC+HD,X
+    LDA NACC+2*HD,X : SBC cnth : STA NACC+2*HD,X
+    DEX : BPL sb
+    \ ---- o = sign(N) * ((|N| + E/2) / E)
+    LDA head : ASL A : ASL A : ASL A : STA qj
+    LDX #0
+.dv STX jcnt
+    LDA NACC,X : STA n0 : LDA NACC+HD,X : STA n1 : LDA NACC+2*HD,X : STA n2
+    JSR sdiv
+    LDX qj : STA OB,X : INC qj
+    LDX jcnt : INX : CPX #HD : BNE dv
+    INC head : LDA head : CMP #NH : BEQ done : JMP headlp
+.done
+    RTS
+.vpatch_lo
+FOR j, 0, HD-1
+    EQUB LO(vc0 + j * VBLK)
+NEXT
+.vpatch_hi
+FOR j, 0, HD-1
+    EQUB HI(vc0 + j * VBLK)
+NEXT
+}
+
+\ sdiv: n2:n1:n0 (signed 24-bit) / E (esh:esl), rounded, -> A (signed)
+.sdiv
+{
+    LDA n2 : STA dsign : BPL p
+    SEC : LDA #0 : SBC n0 : STA n0 : LDA #0 : SBC n1 : STA n1 : LDA #0 : SBC n2 : STA n2
+.p  \ + E/2
+    LDA esh : LSR A : STA ZB : LDA esl : ROR A
+    CLC : ADC n0 : STA n0 : LDA ZB : ADC n1 : STA n1 : BCC p2 : INC n2
+.p2 \ d = E << 7  (d2:d1:d0)
+    LDA esh : LSR A : STA d2
+    LDA esl : ROR A : STA d1
+    LDA #0 : ROR A : STA d0
+    LDA #0 : STA ZA          \ quotient
+    LDX #8
+.lp ASL ZA
+    LDA n0 : CMP d0 : LDA n1 : SBC d1 : LDA n2 : SBC d2 : BCC no
+    LDA n0 : SBC d0 : STA n0 : LDA n1 : SBC d1 : STA n1 : LDA n2 : SBC d2 : STA n2
+    INC ZA
+.no LSR d2 : ROR d1 : ROR d0
+    DEX : BNE lp
+    LDA ZA
+    BIT dsign : BPL r
+    EOR #&FF : CLC : ADC #1
+.r  RTS
+}
+
+\ ============================================================================
+\  one transformer step for token A; logits into LU if want_lu
+\ ============================================================================
+.step
+{
+    STA tok
+    \ ---- embedding: R = E[tok] << EMB_SHIFT
+    LDA #0 : STA ZB : LDA tok
+    LDX #5 : STX ZC            \ tok * 32 (D = 32)
+.m  ASL A : ROL ZB : DEC ZC : BNE m
+    CLC : ADC #LO(emb) : STA ep+1 : LDA ZB : ADC #HI(emb) : STA ep+2
+    LDX #D-1
+.ep LDA &FFFF,X : STA ZA
+    LDA #0 : BIT ZA : BPL e1 : LDA #&FF
+.e1 STA ZB
+    LDY #EMB_SHIFT
+.e2 CPY #0 : BEQ e3 : ASL ZA : ROL ZB : DEY : JMP e2
+.e3 LDA ZA : STA RL,X : LDA ZB : STA RH,X
+    DEX : BPL ep
+    \ ---- ring buffer slot and visible count
+    LDA posl : AND #CTX-1 : STA slot
+    LDA posh : BNE full : LDA posl : CMP #CTX : BCS full
+    ADC #1 : STA nvis : JMP lay
+.full LDA #CTX : STA nvis
+.lay
+    LDA #0 : STA layer
+    LDA #LO(layer_tab) : STA ltp : LDA #HI(layer_tab) : STA ltp+1
+.layer_lp
+    \ copy this layer's table entry
+    LDA ltp : STA lt+1 : LDA ltp+1 : STA lt+2
+    LDX #LAYER_TAB_SIZE-1
+.lt LDA &FFFF,X : STA ly_qkv_w,X : DEX : BPL lt
+    \ ---- attention sub-block
+    JSR norm
+    LDA ly_qkv_w : STA mv_w : LDA ly_qkv_w+1 : STA mv_w+1
+    LDA ly_qkv_b : STA mv_b : LDA ly_qkv_b+1 : STA mv_b+1
+    LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
+    LDA #D+2*HD : STA mv_rows : LDA #D : STA mv_cols
+    JSR matvec
+    LDA #&81 : STA rq_lo
+    LDA #0 : STA rq_src : LDA #D : STA rq_n : LDA ly_sq : STA rq_s
+    LDA #LO(QB) : STA rq_dst : LDA #HI(QB) : STA rq_dst+1 : JSR requant
+    LDA #D : STA rq_src : LDA #HD : STA rq_n : LDA ly_sk : STA rq_s
+    LDA #LO(KB) : STA rq_dst : LDA #HI(KB) : STA rq_dst+1 : JSR requant
+    LDA #D+HD : STA rq_src : LDA ly_sv : STA rq_s
+    LDA #LO(VB) : STA rq_dst : LDA #HI(VB) : STA rq_dst+1 : JSR requant
+    JSR attention
+    LDA ly_o_w : STA mv_w : LDA ly_o_w+1 : STA mv_w+1
+    LDA ly_o_b : STA mv_b : LDA ly_o_b+1 : STA mv_b+1
+    LDA #LO(OB) : STA mv_x : LDA #HI(OB) : STA mv_x+1
+    LDA #D : STA mv_rows : STA mv_cols
+    JSR matvec
+    LDA ly_so : STA rs : JSR resadd
+    \ ---- MLP sub-block
+    JSR norm
+    LDA ly_f1_w : STA mv_w : LDA ly_f1_w+1 : STA mv_w+1
+    LDA ly_f1_b : STA mv_b : LDA ly_f1_b+1 : STA mv_b+1
+    LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
+    LDA #FF : STA mv_rows : LDA #D : STA mv_cols
+    JSR matvec
+    LDA #0 : STA rq_lo : STA rq_src : LDA #FF : STA rq_n : LDA ly_s1 : STA rq_s
+    LDA #LO(HB) : STA rq_dst : LDA #HI(HB) : STA rq_dst+1 : JSR requant
+    LDA ly_f2_w : STA mv_w : LDA ly_f2_w+1 : STA mv_w+1
+    LDA ly_f2_b : STA mv_b : LDA ly_f2_b+1 : STA mv_b+1
+    LDA #LO(HB) : STA mv_x : LDA #HI(HB) : STA mv_x+1
+    LDA #D : STA mv_rows : LDA #FF : STA mv_cols
+    JSR matvec
+    LDA ly_s2 : STA rs : JSR resadd
+    \ next layer
+    LDA ltp : CLC : ADC #LAYER_TAB_SIZE : STA ltp : BCC nl : INC ltp+1
+.nl INC layer : LDA layer : CMP #NL : BEQ ld : JMP layer_lp
+.ld INC posl : BNE pd : INC posh
+.pd LDA want_lu : BEQ out
+    \ ---- head: LU = clamp((Wout * norm(R) + b) >> SL)
+    JSR norm
+    LDA #LO(out_w) : STA mv_w : LDA #HI(out_w) : STA mv_w+1
+    LDA #LO(out_bl) : STA mv_b : LDA #HI(out_bl) : STA mv_b+1
+    LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
+    LDA #NV : STA mv_rows : LDA #D : STA mv_cols
+    JSR matvec
+    LDA #&81 : STA rq_lo
+    LDA #0 : STA rq_src : LDA #NV : STA rq_n : LDA #SL : STA rq_s
+    LDA #LO(LU) : STA rq_dst : LDA #HI(LU) : STA rq_dst+1 : JSR requant
+.out RTS
+}
+
+\ ============================================================================
+\  sampling: temperature (kt = 16/tau), top-k, xorshift16
+\ ============================================================================
+.rng
+    LDA rngh : LSR A
+    LDA rngl : ROR A
+    EOR rngh : STA rngh
+    LDA #0 : ROR A
+    EOR rngl : STA rngl
+    LDA rngh : LSR A : EOR rngl : STA rngl
+    LDA rngl : EOR rngh : STA rngh
+    RTS
+
+.sample
+{
+    \ z = (lu * kt) >> 4 into ACC, track max
+    LDA #&00 : STA mxl : LDA #&80 : STA mxh
+    LDX #NV-1
+.z  STX ZE
+    LDA LU,X : STA ZA
+    LDA kt : JSR mul8
+    STA ZB : LDA TL : STA ZA
+    LDY #4 : JSR asr
+    LDX ZE
+    LDA ZA : STA ACCL,X : LDA ZB : STA ACCH,X
+    LDA ACCL,X : CMP mxl : LDA ACCH,X : SBC mxh
+    BVC v : EOR #&80
+.v  BMI nm
+    LDA ACCL,X : STA mxl : LDA ACCH,X : STA mxh
+.nm DEX : BPL z
+    \ e = EXP[max - z]
+    LDX #NV-1
+.ex SEC : LDA mxl : SBC ACCL,X : TAY : LDA mxh : SBC ACCH,X
+    BNE e0 : CPY #EXP_LEN : BCS e0
+    LDA exptab,Y : JMP e1
+.e0 LDA #0
+.e1 STA EB,X
+    LDA #0 : STA KEEP,X
+    DEX : BPL ex
+    \ top-k
+    LDA topk : BEQ sum : STA ZD
+.tk LDA #&FF : STA ZC          \ best index
+    LDX #0
+.tl LDA EB,X : BEQ tn : LDA KEEP,X : BNE tn
+    LDY ZC : BMI tb
+    LDA EB,X : CMP EB,Y : BCC tn : BEQ tn
+.tb STX ZC
+.tn INX : CPX #NV : BNE tl
+    LDX ZC : BMI tz
+    LDA #1 : STA KEEP,X
+    DEC ZD : BNE tk
+.tz LDX #NV-1
+.tc LDA KEEP,X : BNE tq : STA EB,X
+.tq DEX : BPL tc
+.sum
+    LDA #0 : STA esl : STA esh
+    LDX #NV-1
+.sm LDA EB,X : CLC : ADC esl : STA esl : BCC s1 : INC esh
+.s1 DEX : BPL sm
+    \ mask = smallest 2^b-1 >= E-1   (ZC:ZD = E-1, ZA:ZB = mask)
+    SEC : LDA esl : SBC #1 : STA ZC : LDA esh : SBC #0 : STA ZD
+    LDA #1 : STA ZA : LDA #0 : STA ZB
+.mk LDA ZA : CMP ZC : LDA ZB : SBC ZD : BCS md
+    SEC : ROL ZA : ROL ZB : JMP mk
+.md
+.rr JSR rng
+    LDA rngl : AND ZA : STA ZC : LDA rngh : AND ZB : STA ZD
+    LDA ZC : CMP esl : LDA ZD : SBC esh : BCS rr
+    \ walk
+    LDX #0
+.wk LDA ZC : CMP EB,X : LDA ZD : SBC #0 : BCC got
+    LDA ZC : SBC EB,X : STA ZC : LDA ZD : SBC #0 : STA ZD
+    INX : JMP wk
+.got TXA
+    RTS
+}
+
+\ ============================================================================
+\  screen: header, status, a scrolling word-wrapped text window with cursor
+\ ============================================================================
+TEXT_COLOUR = &87
+CURSOR = &7F               \ solid block
+
+\ SCR = address of (crow, ccol)
+.scraddr
+    LDX crow
+    LDA rowlo,X : CLC : ADC ccol : STA SCR
+    LDA rowhi,X : ADC #0 : STA SCR+1
+    RTS
+
+.cursor_on
+    LDA ccol : CMP #40 : BCS co
+    JSR scraddr : LDY #0 : LDA #CURSOR : STA (SCR),Y
+.co RTS
+.cursor_off
+    LDA ccol : CMP #40 : BCS co
+    JSR scraddr : LDY #0 : LDA #' ' : STA (SCR),Y
+    RTS
+
+.clear_window
+{
+    LDX #WTOP
+.r  LDA rowlo,X : STA SCR : LDA rowhi,X : STA SCR+1
+    LDY #0 : LDA #TEXT_COLOUR : STA (SCR),Y
+    LDA #' '
+.c  INY : STA (SCR),Y : CPY #39 : BNE c
+    INX : CPX #WBOT+1 : BNE r
+    LDA #WTOP : STA crow : LDA #1 : STA ccol
+    LDA #0 : STA wordlen : STA endsent
+    LDA #1 : STA capnext
+    RTS
+}
+
+.newline
+{
+    LDA #1 : STA ccol
+    LDA crow : CMP #WBOT : BEQ scroll
+    INC crow : RTS
+.scroll
+    LDX #WTOP
+.r  LDA rowlo,X : STA cp_d+1 : LDA rowhi,X : STA cp_d+2
+    LDA rowlo+1,X : STA cp_s+1 : LDA rowhi+1,X : STA cp_s+2
+    LDY #39
+.cp_s LDA &FFFF,Y
+.cp_d STA &FFFF,Y
+    DEY : BNE cp_s
+    INX : CPX #WBOT : BNE r
+    LDA rowlo+WBOT : STA SCR : LDA rowhi+WBOT : STA SCR+1
+    LDY #39 : LDA #' '
+.c  STA (SCR),Y : DEY : BNE c
+    RTS
+}
+
+\ fix_i: a lone "i" becomes "I"
+.fix_i
+{
+    LDA wordlen : CMP #1 : BNE no
+    DEC ccol : JSR scraddr : INC ccol
+    LDY #0 : LDA (SCR),Y : CMP #'i' : BNE no
+    LDA #'I' : STA (SCR),Y
+.no RTS
+}
+
+\ putc: show token A in the text window
+.putc
+{
+    TAX : LDA vocab,X : STA ZE
+    JSR cursor_off
+    LDA ZE : CMP #10 : BNE notnl
+    JSR fix_i
+    LDA ccol : CMP #1 : BEQ nl1
+    JSR newline
+.nl1 LDA #1 : STA capnext : LDA #0 : STA endsent : STA wordlen
+    JMP cursor_on
+.notnl CMP #' ' : BNE word
+    JSR fix_i
+    LDA #0 : STA wordlen
+    LDA endsent : BEQ sp1 : LDA #1 : STA capnext
+.sp1 LDA #0 : STA endsent
+    LDA ccol : CMP #1 : BEQ sp2
+    CMP #40 : BCC sp3
+    JSR newline : JMP cursor_on
+.sp3 JSR scraddr : LDY #0 : LDA #' ' : STA (SCR),Y : INC ccol
+.sp2 JMP cursor_on
+.word
+    \ letters: capitalise at the start of a sentence; punctuation: fix lone i
+    LDA ZE : CMP #'a' : BCC punct
+    LDA capnext : BEQ w1
+    LDA ZE : AND #&DF : STA ZE
+.w1 LDA #0 : STA capnext : STA endsent : JMP place
+.punct
+    JSR fix_i
+    LDA ZE : CMP #'0' : BCC p0 : LDA #0 : STA capnext   \ digit
+.p0 LDA ZE
+    CMP #'.' : BEQ es : CMP #'!' : BEQ es : CMP #'?' : BEQ es
+    CMP #'"' : BEQ place : CMP #''' : BEQ place
+    LDA #0 : STA endsent : JMP place
+.es LDA #1 : STA endsent
+.place
+    LDA ccol : CMP #40 : BCC put
+    \ line full: carry the current word over to the next line
+    LDA wordlen : BEQ nw : CMP #30 : BCS nw
+    LDA #40 : SEC : SBC wordlen : STA ccol : JSR scraddr
+    LDY #0
+.mv LDA (SCR),Y : STA wordbuf,Y : LDA #' ' : STA (SCR),Y
+    INY : CPY wordlen : BNE mv
+    JSR newline : JSR scraddr
+    LDY #0
+.mv2 LDA wordbuf,Y : STA (SCR),Y : INY : CPY wordlen : BNE mv2
+    TYA : CLC : ADC #1 : STA ccol
+    JMP put
+.nw JSR newline
+.put JSR scraddr : LDY #0 : LDA ZE : STA (SCR),Y
+    INC ccol : INC wordlen
+    JMP cursor_on
+}
+
+\ print a 0-terminated string at (row X, column Y); string pointer in ZA/ZB
+.print_at
+{
+    LDA rowlo,X : STA SCR : LDA rowhi,X : STA SCR+1
+    TYA : CLC : ADC SCR : STA SCR : BCC p : INC SCR+1
+.p  LDY #0
+.l  LDA (ZA),Y : BEQ d : STA (SCR),Y : INY : BNE l
+.d  RTS
+}
+MACRO SHOWSTR prow, pcol, pstr
+    LDA #LO(pstr) : STA ZA : LDA #HI(pstr) : STA ZB
+    LDX #prow : LDY #pcol : JSR print_at
+ENDMACRO
+
+.draw_screen
+    SHOWSTR 0, 0, s_title
+    SHOWSTR 1, 0, s_title
+    SHOWSTR 2, 0, s_sub
+    SHOWSTR 24, 0, s_help
+    JSR show_msg_idle
+    JMP status
+
+.show_msg_idle
+    SHOWSTR 23, 0, s_idle
+    RTS
+
+\ status line (row 3): temperature, top-k, speed, characters generated
+.status
+{
+    SHOWSTR 3, 0, s_status
+    LDX tidx : LDA tstr0,X : STA SCREEN+3*40+6 : LDA tstr1,X : STA SCREEN+3*40+8
+    LDX kidx : LDA kstr0,X : STA SCREEN+3*40+17 : LDA kstr1,X : STA SCREEN+3*40+18
+    \ rate (tok/s * 100) as d.dd
+    LDA ratel : STA n0 : LDA rateh : STA n1
+    LDX #0 : JSR digit
+    LDX #1 : JSR digit : STA SCREEN+3*40+20
+    LDA #'.' : STA SCREEN+3*40+21
+    LDX #2 : JSR digit : STA SCREEN+3*40+22
+    LDX #3 : JSR digit : STA SCREEN+3*40+23
+    LDA paused : BEQ np
+    SHOWSTR 3, 31, s_paused
+.np RTS
+}
+\ digit: next decimal digit of n1:n0 for the power of ten at X (1000,100,10,1)
+.digit
+{
+    LDY #'0'
+.l  LDA n0 : CMP p10l,X : LDA n1 : SBC p10h,X : BCC d
+    LDA n0 : SBC p10l,X : STA n0 : LDA n1 : SBC p10h,X : STA n1
+    INY : BNE l
+.d  TYA : RTS
+}
+.p10l EQUB LO(1000), LO(100), LO(10), 1
+.p10h EQUB HI(1000), HI(100), HI(10), 0
+
+\ ============================================================================
+\  timing: tokens/second over a window of up to 100 tokens (OS centisecond clock)
+\ ============================================================================
+.read_clock
+    LDA #1 : LDX #LO(clk) : LDY #HI(clk) : JMP OSWORD
+
+.rate_start
+    JSR read_clock
+    LDA clk : STA t0 : LDA clk+1 : STA t0+1
+    LDA #0 : STA ntok
+    RTS
+
+.rate_tick
+{
+    INC ntok
+    JSR read_clock
+    SEC : LDA clk : SBC t0 : STA dvl : LDA clk+1 : SBC t0+1 : STA dvh
+    ORA dvl : BEQ out
+    \ rate = ntok * 10000 / cs
+    LDA #0 : STA n0 : STA n1 : STA n2
+    LDX ntok
+.m  CLC : LDA n0 : ADC #LO(10000) : STA n0 : LDA n1 : ADC #HI(10000) : STA n1
+    BCC m1 : INC n2
+.m1 DEX : BNE m
+    JSR div24
+    LDA n2 : BNE out
+    LDA n0 : STA ratel : LDA n1 : STA rateh
+    LDA ntok : CMP #100 : BCC out
+    JSR rate_start
+.out RTS
+}
+\ n2:n1:n0 /= dvh:dvl (24-bit by 16-bit)
+.div24
+{
+    LDA #0 : STA ZA : STA ZB
+    LDX #24
+.l  ASL n0 : ROL n1 : ROL n2 : ROL ZA : ROL ZB
+    LDA ZA : CMP dvl : LDA ZB : SBC dvh : BCC n
+    STA ZB : LDA ZA : SBC dvl : STA ZA : INC n0
+.n  DEX : BNE l
+    RTS
+}
+
+\ ============================================================================
+\  main program
+\ ============================================================================
+.osb   \ OSBYTE A with X, Y=0
+    LDY #0 : JMP OSBYTE
+
+.init_squares
+{
+    \ f(n) = n*n/4: f(n+1) = f(n) + (n+1)/2
+    LDA #0 : STA ZA : STA ZB
+    LDX #0
+.l  LDA ZA : STA SQL+&100,X : LDA ZB : STA SQH+&100,X
+    TXA : BEQ n
+    EOR #&FF : CLC : ADC #1 : TAY          \ 256 - n
+    LDA ZA : STA SQL,Y : LDA ZB : STA SQH,Y
+.n  TXA : CLC : ADC #1 : ROR A             \ (n+1)/2 (9-bit)
+    CLC : ADC ZA : STA ZA : BCC c : INC ZB
+.c  INX : BNE l
+    LDA ZA : STA SQL : LDA ZB : STA SQH     \ f(256) at n = -256
+    LDA #HI(SQL) : STA PL+1 : STA QL+1
+    LDA #HI(SQH) : STA PH+1 : STA QH+1
+    RTS
+}
+
+.main
+{
+    TSX : STX savesp                   \ so quit can return to BASIC from any depth
+    LDX #&7F
+.sv LDA &00,X : STA zsave,X : DEX : BPL sv
+    LDA #4 : LDX #1 : JSR osb          \ cursor keys give codes
+    LDA #229 : LDX #1 : JSR osb        \ ESCAPE is an ordinary key
+    LDX #0
+.v  LDA vdu_init,X : JSR OSWRCH : INX : CPX #vdu_init_end - vdu_init : BNE v
+    JSR init_squares
+    LDA #DEFAULT_T : STA tidx : LDA #DEFAULT_K : STA kidx
+    JSR settings
+    LDA #0 : STA paused : STA ratel : STA rateh : STA qlen : STA histn : STA plen
+    JSR draw_screen
+    JSR new_sample
+.loop
+.^main_loop
+    LDA #&81 : LDX #0 : LDY #0 : JSR OSBYTE
+    CPY #0 : BNE nokey
+    JSR key
+.nokey
+    LDA paused : BNE loop
+    LDA qpos : CMP qlen : BCS gen
+    \ feed the next queued (prompt) character
+    TAX : LDA queue,X : STA ZD
+    INC qpos
+    LDA #0 : LDX qpos : CPX qlen : BNE f1 : LDA #1
+.f1 STA want_lu
+    CPX #1 : BEQ f2                     \ the leading newline isn't shown
+    LDA ZD : JSR putc
+.f2 LDA ZD : JSR step
+    LDA qpos : CMP qlen : BNE loop
+    JSR rate_start
+    JMP loop
+.gen
+    JSR sample
+    JSR emit
+    PHA : JSR putc : PLA
+    LDX #1 : STX want_lu
+    JSR step
+    JSR rate_tick
+    JSR status
+    JMP loop
+}
+
+\ emit: the test harness watches this address (A = sampled token)
+.emit
+    LDX histn : STA hist,X : INC histn
+    RTS
+
+.settings
+    LDX tidx : LDA ttab,X : STA kt
+    LDX kidx : LDA ktab,X : STA topk
+    RTS
+
+.key
+{
+    TXA
+    CMP #' ' : BNE k1 : JMP new_sample
+.k1 CMP #13 : BNE k2 : JMP prompt
+.k2 CMP #',' : BEQ td : CMP #'<' : BEQ td
+    CMP #'.' : BEQ tu : CMP #'>' : BEQ tu
+    AND #&DF
+    CMP #'K' : BEQ kk
+    CMP #'P' : BEQ pp
+    CMP #'Q' : BEQ qq
+    CPX #27 : BEQ qq
+    RTS
+.td LDA tidx : BEQ s : DEC tidx : JMP s
+.tu LDA tidx : CMP #NTEMPS-1 : BEQ s : INC tidx : JMP s
+.kk INC kidx : LDA kidx : CMP #NTOPK : BCC s : LDA #0 : STA kidx
+.s  JSR settings : JMP status
+.pp LDA paused : EOR #1 : STA paused : JMP status
+.qq JMP quit
+}
+
+\ new_sample: clear the window, reset the model, reseed, queue newline + prompt
+.new_sample
+{
+    JSR clear_window
+    JSR cursor_on
+    LDA #0 : STA posl : STA posh : STA qpos
+    LDA testseed : ORA testseed+1 : BEQ hw
+    LDA testseed : STA rngl : LDA testseed+1 : STA rngh : JMP sd
+.hw LDA &FE44 : EOR &FE64 : STA rngl
+    LDA &FE45 : EOR &FE65 : EOR clk : STA rngh
+    ORA rngl : BNE sd : INC rngl
+.sd LDA #0 : STA queue                  \ token 0 = newline
+    LDX plen : INX : STX qlen
+    LDX #0
+.cp CPX plen : BEQ d
+    LDA ptok,X : STA queue+1,X : INX : BNE cp
+.d  LDA #0 : STA ratel : STA rateh
+    JSR status
+    RTS
+}
+
+\ prompt: read a line on row 23, then start a new sample from it
+PMAX = 36
+.prompt
+{
+    SHOWSTR 23, 0, s_prompt
+    LDA #0 : STA plen
+.l  LDA plen : CLC : ADC #3 : TAX : LDA #CURSOR : STA SCREEN+23*40,X
+    JSR OSRDCH
+    CMP #13 : BEQ done
+    CMP #27 : BEQ cancel
+    CMP #127 : BEQ del
+    \ map to a token
+    CMP #'A' : BCC m : CMP #'Z'+1 : BCS m : ORA #&20
+.m  STA ZE
+    LDX #NV-1
+.f  LDA vocab,X : CMP ZE : BEQ fnd : DEX : BNE f    \ (token 0 = newline: not typeable)
+    JMP l
+.fnd LDY plen : CPY #PMAX : BCS l
+    TXA : STA ptok,Y
+    LDA plen : CLC : ADC #3 : TAX : LDA ZE : STA SCREEN+23*40,X
+    INC plen : JMP l
+.del LDA plen : BEQ l
+    CLC : ADC #3 : TAX : LDA #' ' : STA SCREEN+23*40,X
+    DEC plen : JMP l
+.cancel
+    LDA #&7E : LDX #0 : JSR osb         \ acknowledge escape (harmless)
+    LDA #0 : STA plen
+    JSR show_msg_idle : RTS
+.done
+    JSR show_msg_idle
+    JSR new_sample
+    LDA #0 : STA plen                   \ the prompt is used once
+    RTS
+}
+
+.quit
+{
+    LDA #4 : LDX #0 : JSR osb
+    LDA #229 : LDX #0 : JSR osb
+    LDA #18 : LDX #0 : JSR osb          \ clear soft keys (their buffer held the multiply table)
+.wk LDA #&7A : JSR OSBYTE : CPX #&FF : BNE wk   \ wait for Q / ESCAPE to be let go
+    LDA #15 : LDX #1 : JSR osb          \ then flush the keyboard buffer
+    LDX #&7F
+.rs LDA zsave,X : STA &00,X : DEX : BPL rs
+    \ leave BASIC an empty program at PAGE (our code overwrote it)
+    LDA #&0D : STA &1900 : LDA #&FF : STA &1901
+    LDA #&02 : STA &12 : STA &00 : STA &02
+    LDA #&19 : STA &13 : STA &01 : STA &03
+    LDA #22 : JSR OSWRCH : LDA #7 : JSR OSWRCH
+    LDX savesp : TXS
+    RTS
+}
+
+\ ============================================================================
+\  data
+\ ============================================================================
+.vdu_init
+    EQUB 22, 7                          \ MODE 7
+    EQUB 23, 1, 0, 0, 0, 0, 0, 0, 0, 0  \ cursor off
+.vdu_init_end
+
+.rowlo
+FOR r, 0, 24 : EQUB LO(SCREEN + r * 40) : NEXT
+.rowhi
+FOR r, 0, 24 : EQUB HI(SCREEN + r * 40) : NEXT
+
+.vocab EQUB 10 : EQUS " abcdefghijklmnopqrstuvwxyz.,'", 34, "-;:!?0123456789"
+ASSERT P% - vocab = NV
+
+\ temperatures 0.3 .. 1.5 as kt = 16 / T
+NTEMPS = 10 : DEFAULT_T = 4
+.ttab  EQUB 53, 32, 27, 23, 20, 18, 16, 15, 13, 11
+.tstr0 EQUS "0000001111"
+.tstr1 EQUS "3567890125"
+NTOPK = 6 : DEFAULT_K = 4
+.ktab  EQUB 0, 1, 3, 5, 10, 20
+.kstr0 EQUS "-   12"
+.kstr1 EQUS "-13500"
+
+.testseed EQUW 0                        \ non-zero: fixed seed (test harness)
+
+.model
+INCBIN "../build/model.bin"
+INCLUDE "../build/model_data.6502"
+.end_of_file
+
+\ ---- uninitialised data
+.zsave  SKIP 128
+.RL SKIP D : .RH SKIP D
+.X8 SKIP D
+.QB SKIP D : .KB SKIP HD : .VB SKIP HD
+.OB SKIP D
+.HB SKIP FF
+.LU SKIP NV
+.EB SKIP 64
+.KEEP SKIP NV
+.NACC SKIP 3 * HD
+.kcache SKIP NL * HD * CTX
+.vcache SKIP NL * HD * CTX
+.queue SKIP PMAX + 2
+.ptok SKIP PMAX + 2
+.wordbuf SKIP 40
+.clk SKIP 5
+.ly_qkv_w SKIP 2 : .ly_qkv_b SKIP 2 : .ly_o_w SKIP 2 : .ly_o_b SKIP 2
+.ly_f1_w SKIP 2 : .ly_f1_b SKIP 2 : .ly_f2_w SKIP 2 : .ly_f2_b SKIP 2 : .ly_rb SKIP 2
+.ly_kc SKIP 2 : .ly_vc SKIP 2
+.ly_sq SKIP 1 : .ly_sk SKIP 1 : .ly_sv SKIP 1 : .ly_so SKIP 1 : .ly_s1 SKIP 1 : .ly_s2 SKIP 1 : .ly_sqk SKIP 1 : .ly_pad SKIP 1
+.mv_w SKIP 2 : .mv_b SKIP 2 : .mv_x SKIP 2 : .mv_rows SKIP 1 : .mv_cols SKIP 1 : .mv_j SKIP 1
+.rq_lo SKIP 1 : .rq_src SKIP 1 : .rq_n SKIP 1 : .rq_s SKIP 1 : .rq_dst SKIP 2 : .rq_i SKIP 1
+.rs SKIP 1
+.nm_sh SKIP 1 : .nm_r SKIP 1 : .nm_rl SKIP 1 : .nm_rh SKIP 1
+.kp SKIP 2 : .vp SKIP 2 : .head SKIP 1 : .qj SKIP 1 : .jcnt SKIP 1
+.mxl SKIP 1 : .mxh SKIP 1 : .esl SKIP 1 : .esh SKIP 1 : .cntl SKIP 1 : .cnth SKIP 1
+.n0 SKIP 1 : .n1 SKIP 1 : .n2 SKIP 1 : .d0 SKIP 1 : .d1 SKIP 1 : .d2 SKIP 1 : .dsign SKIP 1
+.tok SKIP 1 : .slot SKIP 1 : .nvis SKIP 1 : .posl SKIP 1 : .posh SKIP 1 : .layer SKIP 1 : .ltp SKIP 2
+.want_lu SKIP 1 : .kt SKIP 1 : .topk SKIP 1 : .rngl SKIP 1 : .rngh SKIP 1
+.tidx SKIP 1 : .kidx SKIP 1 : .paused SKIP 1 : .qpos SKIP 1 : .qlen SKIP 1 : .plen SKIP 1
+.crow SKIP 1 : .ccol SKIP 1 : .wordlen SKIP 1 : .capnext SKIP 1 : .endsent SKIP 1
+.t0 SKIP 2 : .ntok SKIP 1 : .dvl SKIP 1 : .dvh SKIP 1 : .ratel SKIP 1 : .rateh SKIP 1
+.histn SKIP 1
+.savesp SKIP 1
+.hist SKIP 256
+.end_of_bss
+
+PRINT "code+tables", ~start, "-", ~model, "(", model - start, "bytes )"
+PRINT "model      ", ~model, "-", ~end_of_file, "(", end_of_file - model, "bytes )"
+PRINT "bss        ", ~end_of_file, "-", ~end_of_bss, "(", end_of_bss - end_of_file, "bytes )"
+PRINT "free       ", &7C00 - end_of_bss, "bytes"
+
+SAVE "LLM", start, end_of_file, main
+PUTTEXT "boot.txt", "!BOOT", 0
+\ symbols for the test harness
+PRINT "SYM emit", ~emit
+PRINT "SYM step", ~step
+PRINT "SYM sample", ~sample
+PRINT "SYM testseed", ~testseed
+PRINT "SYM tidx", ~tidx
+PRINT "SYM kidx", ~kidx
+PRINT "SYM kt", ~kt
+PRINT "SYM topk", ~topk
+PRINT "SYM LU", ~LU
+PRINT "SYM histn", ~histn
+PRINT "SYM hist", ~hist
+PRINT "SYM posl", ~posl
+PRINT "SYM RL", ~RL
+PRINT "SYM X8", ~X8
+PRINT "SYM QB", ~QB
+PRINT "SYM OB", ~OB
+PRINT "SYM HB", ~HB
+PRINT "SYM norm", ~norm
+PRINT "SYM attention", ~attention
+PRINT "SYM matvec", ~matvec
+PRINT "SYM resadd", ~resadd
+PRINT "SYM requant", ~requant
+PRINT "SYM main", ~main
+PRINT "SYM colmac", ~colmac
+PRINT "SYM mul8", ~mul8
+PRINT "SYM asr", ~asr
+PRINT "SYM clamp", ~clamp
+PRINT "SYM sdiv", ~sdiv
+PRINT "SYM putc", ~putc
+PRINT "SYM status", ~status
+PRINT "SYM rate_tick", ~rate_tick
+PRINT "SYM read_clock", ~read_clock
+PRINT "SYM print_at", ~print_at
+PRINT "SYM digit", ~digit
+PRINT "SYM rng", ~rng
+PRINT "SYM loop", ~main_loop

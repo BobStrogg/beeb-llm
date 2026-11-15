@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BEEB-LLM - a transformer language model on a BBC Micro</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="icon" href="favicon.ico">
+<style>
+  html, body { touch-action: manipulation; }
+  body { background:#000; color:#fff; font-family: "Courier New", monospace; margin:0; padding:16px; }
+  h1 { color:#ff0; background:#00f; display:inline-block; padding:2px 12px; margin:0 0 8px; letter-spacing:2px; }
+  .wrap { display:flex; flex-wrap:wrap; gap:16px; align-items:flex-start; }
+  #stage { width: 820px; max-width: 100%; }
+  iframe { width: 100%; aspect-ratio: 4 / 3.2; border: 2px solid #333; background:#000; display:block; }
+  table { border-collapse: collapse; }
+  td { padding: 2px 10px 2px 0; vertical-align: top; }
+  td:first-child { color:#0ff; white-space:nowrap; }
+  a { color:#0f0; }
+  .note { color:#aaa; max-width: 820px; font-size: 13px; }
+  .keys { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .keys button, #promptform button { font: inherit; font-size: 15px; color:#fff; background:#222; border:1px solid #555; border-radius:6px;
+      padding: 8px 12px; min-height: 40px; touch-action: none; -webkit-user-select:none; user-select:none; cursor:pointer; }
+  .keys button.on { background:#06c; }
+  .keys button b { color:#ff0; }
+  #promptform { display:flex; gap:6px; margin-top:8px; }
+  #prompt { flex:1; font: inherit; font-size:16px; background:#111; color:#0ff; border:1px solid #555; border-radius:6px; padding:8px; min-width:0; }
+</style>
+</head>
+<body>
+<h1>BEEB-LLM</h1>
+<div class="note"><b>A transformer language model running on a 1981 BBC Micro Model B.</b>
+A 17K-parameter character-level transformer (2 layers, 4 heads, 32-character context, int8 weights) trained on a public-domain stand-in (Jerome K. Jerome's <i>Three Men in a Boat</i> and <i>Three Men on the Bummel</i>) types out new text at about 1.6 characters a second.
+It runs in pure 6502 machine code in <a href="https://github.com/mattgodbolt/jsbeeb">jsbeeb</a> (BBC B, DFS 1.2), booted with SHIFT+BREAK.
+Click the emulator to give it the keyboard.</div>
+<div class="wrap">
+  <div id="stage">
+    <iframe id="beeb" src="jsbeeb/index.html?model=B-DFS1.2&amp;disc=beeb-llm.ssd&amp;autoboot&amp;embed" allow="autoplay; fullscreen" onload="this.contentWindow.focus()"></iframe>
+    <div class="keys">
+      <button data-code="Space" data-key=" "><b>SPACE</b> new</button>
+      <button data-code="Comma" data-key=","><b>&lt;</b> cooler</button>
+      <button data-code="Period" data-key="."><b>&gt;</b> hotter</button>
+      <button data-code="KeyK" data-key="k"><b>K</b> top-k</button>
+      <button data-code="KeyP" data-key="p"><b>P</b> pause</button>
+      <button data-code="KeyQ" data-key="q"><b>Q</b> quit</button>
+    </div>
+    <form id="promptform" autocomplete="off">
+      <input id="prompt" maxlength="36" placeholder="start it off with a prompt…" enterkeyhint="go">
+      <button type="submit">Prompt</button>
+    </form>
+  </div>
+  <table>
+    <tr><td>SPACE</td><td>new sample (random seed)</td></tr>
+    <tr><td>RETURN</td><td>type a prompt on the bottom line, RETURN to start from it (ESCAPE cancels)</td></tr>
+    <tr><td>&lt; &gt; (or , .)</td><td>temperature down / up: 0.3 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.5</td></tr>
+    <tr><td>K</td><td>top-k: off, 1 (greedy), 3, 5, 10, 20</td></tr>
+    <tr><td>P</td><td>pause / resume</td></tr>
+    <tr><td>Q / ESCAPE</td><td>quit to BASIC (type <code>*RUN LLM</code> to start again)</td></tr>
+    <tr><td colspan="2"><a href="jsbeeb/index.html?model=B-DFS1.2&amp;disc=beeb-llm.ssd&amp;autoboot">Open in the full jsbeeb UI</a> &middot;
+      <a href="jsbeeb/discs/beeb-llm.ssd" download>Download beeb-llm.ssd</a></td></tr>
+  </table>
+</div>
+<p class="note">The status line shows the temperature, top-k and the measured speed in characters (tokens) per second.
+The model only knows lower case; the Beeb capitalises sentences and a lone "i" as it types.</p>
+<p class="note">Source, the training pipeline, discs and an MMFS image: <a href="https://github.com/BobStrogg/beeb-llm">github.com/BobStrogg/beeb-llm</a></p>
+<script src="keys.js"></script>
+</body>
+</html>
