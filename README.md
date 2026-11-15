@@ -2,17 +2,19 @@
 
 **A transformer language model running natively on a 1981 BBC Micro Model B**
 (6502 at 2 MHz, 32K RAM, OS 1.20), in MODE 7, typing out new text a character
-at a time. It's pure integer 6502 machine code: no second processor and no
-co-processor tricks.
+at a time. It's pure integer 6502 machine code. It runs on a plain Model B, and
+if it finds a **6502 Second Processor** it runs there instead, with room for
+models three times the size.
 
-**Play it in your browser:** https://bobstrogg.github.io/beeb-llm/ (jsbeeb)
+**Play it in your browser:** https://bobstrogg.github.io/beeb-llm/ (jsbeeb, Model B)
+or https://bobstrogg.github.io/beeb-llm/?machine=2p (Model B + 6502 Second Processor)
 
 ![BEEB-LLM generating text](docs/images/generating.png)
 
 It's a real (very small) GPT-style network: token embedding, two transformer
 blocks with multi-query self-attention and a ReLU MLP, RMSNorm, and an output
 layer over a 47-character alphabet. It was trained on a PC, quantised to 8-bit
-integers, and is run by a 4.9 KB inference engine on the Beeb. The 6502's
+integers, and is run by a 5.4 KB inference engine on the Beeb. The 6502's
 output matches a Python reference model **bit for bit**: every logit and every
 sampled character.
 
@@ -21,9 +23,43 @@ Men in a Boat* and *Three Men on the Bummel*. The pipeline is set up so you
 can drop in your own copy of *The Hitchhiker's Guide to the Galaxy* and
 retrain with one command ([below](#train-it-on-your-own-book)).
 
+## Four models, one disc
+
+The disc holds four models trained the same way on the same text. At boot
+BEEB-LLM checks for a second processor (OSBYTE &EA) and which machine it is on
+(OSBYTE 0), shows a menu of the models with their size, speed on this machine
+and whether they fit, and after five seconds starts the default:
+the biggest model that fits **and** manages at least one character a second.
+That's **Small** on a Model B and **Medium** on a second processor.
+Pick another with 1–4 or the cursor keys and RETURN; **M** brings the menu
+back at any time.
+
+| Model | Params | Shape | RAM | Bits/char | Chars/s Model B | Chars/s 2P | Sample (seed 1234, temp 0.8, top-k 10, prompt "the ") |
+|---|---|---|---|---|---|---|---|
+| **Tiny** | 10,447 | 2 × d24, MLP 48 | 11.8 KB | 2.33 | 2.35 | 3.59 | the sleep about of a speare fied to stortaine thame." / "i shall old and my were finish mind… |
+| **Small** | 16,975 | 2 × d32, MLP 64 | 18.2 KB | 2.22 | 1.57 | 2.40 | the times a she watch his being to mysely take affuling if you dear, whichings. the seemed of… |
+| **Medium** | 34,639 | 2 × d48, MLP 96 | 35.6 KB | 2.05 | doesn't fit | 1.32 | the top of children and the tail because, and a looked tasten, they boat. she metholing to… |
+| **Large** | 49,679 | 3 × d48, MLP 96 | 51.1 KB | 2.00 | doesn't fit | 0.92 | the toiment shutted off it the sobatheth, to stains to say, in the ocertain, and still me as… |
+
+Bits per character are for the integer model on held-out text (lower is
+better). Speeds were measured in jsbeeb over 6 × 200 characters with
+`test/verify.mjs`; the Second Processor is a 3 MHz 65C02, about 1.53× faster.
+Medium and Large need the second processor's memory (and wider rows than the
+Model B's zero-page accumulators allow), so the Model B menu shows them in blue.
+
+![the boot menu on a Model B](docs/images/menu-model-b.png)
+![the boot menu with a 6502 Second Processor](docs/images/menu-2p.png)
+
+How the sizes were chosen: a sweep of 10 shapes (6,000 + 1,000 QAT steps each)
+for the best bits per character per 6502 cycle. Two layers of width 24 beat one
+layer of 32 and two of 16 for Tiny; for Medium, d48 × 2 layers (2.160 bpc, 1.33
+chars/s on the 2P) beat d40 × 3 (2.153, 1.23) and d32 × 4 (2.159, 1.30) on
+speed for the same quality; for Large, d48 × 3 (2.079) beat d56 × 2 (2.114).
+The chosen four were then trained for 14,000 + 3,000 steps.
+
 ## What it writes
 
-These are real outputs from the stand-in model (identical on the Beeb and in
+These are real outputs from the stand-in Small model (identical on the Beeb and in
 `tools/intref.py`). The Beeb adds the capital letters as it types:
 
 > **The meaning of life**. He rawing it out they had been spood him, while mething the black all set which an into sung to only with the river, I sin to get toms, and I addle...
@@ -49,7 +85,8 @@ same the same...", so the default is temperature 0.8 with top-k 10.
 | `<` `>` (or `,` `.`) | temperature 0.3, 0.5, 0.6, 0.7, **0.8**, 0.9, 1.0, 1.1, 1.2, 1.5 |
 | K | top-k: off, 1 (greedy), 3, 5, **10**, 20 |
 | P | pause / resume |
-| Q or ESCAPE | quit to BASIC (`*RUN LLM` or `*LLM` starts it again) |
+| M | back to the model menu |
+| Q or ESCAPE | quit to BASIC (`*RUN LLM`, or `*RUN LLMP` on a second processor, starts it again) |
 
 The status line shows temperature, top-k and the measured speed in tokens per
 second (one token = one character). The web page also has on-screen buttons
@@ -57,7 +94,7 @@ and a prompt box for phones.
 
 ![a prompt](docs/images/prompt.png)
 
-## Model
+## Model (Small)
 
 | | |
 |---|---|
@@ -70,20 +107,39 @@ and a prompt box for phones.
 | Parameters | **16,975** (16,320 weights, 399 biases, 256 relative-position biases) |
 | Storage | 17,630 bytes: int8 weights, int16 biases, plus the norm and exp tables |
 | Quality | about 2.2–2.3 bits per character on held-out text (float 2.25, QAT 2.29, integer model 2.22 on its own sample of windows) |
-| Speed | **1.58 tokens/s** (1.26 million 6502 cycles per token, measured in jsbeeb; the on-screen meter shows 1.56 because it includes the display) |
+| Speed | **1.57 characters/s** on a Model B (about 1.27 million 6502 cycles per character, measured in jsbeeb), 2.40 on a 6502 Second Processor |
 
-Memory map (32K Model B, DFS/MMFS, PAGE = &1900):
+Memory map, Model B (PAGE = &1900; program `LLM`):
 
 | Address | Contents |
 |---|---|
-| &0000–&008F | zero page: 64 16-bit accumulators, multiply pointers (BASIC's zero page is saved and restored) |
+| &0000–&007F | zero page: 64 16-bit accumulators (BASIC is restarted on exit) |
 | &0900–&0CFF | quarter-square table f(n) = ⌊n²/4⌋, n = −256…255, built at start-up |
-| &1900–&2C2F | code, screen text, tables (4.9 KB) |
-| &2C30–&714A | the model (17.3 KB) |
-| &714A–&7950 | KV cache (1 KB), activations, buffers |
+| &1900–&2E14 | code, screen text, tables (5.4 KB) |
+| &2E15–&316D | activations and buffers |
+| &316E–&7BFF | 19,090 bytes for a model and its KV cache (or the menu overlay) |
 | &7C00–&7FFF | MODE 7 screen |
 
-### Size / quality trade-off
+On a 6502 Second Processor (program `LLMP`) the code starts at &0800, the
+multiply table goes in BASIC's old workspace at &0400, the accumulators move
+to a page-aligned buffer (128 rows) and 54,551 bytes from &22E9 to &F7FF are
+free for the model. Its screen output goes across the Tube through OSWRCH,
+the same as the Model B build.
+
+### Model files and the menu
+
+`tools/export_beeb.py` writes each model as a relocatable file (`M0`–`M3`): a
+20-byte header (d, layers, MLP width, context, vocabulary, norm and output
+shifts, offsets) and a 30-byte entry per layer with the offsets of its
+matrices and its shifts. The engine loads the file at the end of its own
+data, adds the load address to every offset and gives each layer a slice of
+KV cache after the model, so one engine runs every shape (head size is fixed
+at 8; d, layers, MLP width and context come from the header). The boot menu
+(`MENU` / `MENUP`) is an overlay loaded into the same space. `!BOOT` is one
+line of BASIC that asks OSBYTE &EA whether there is a Tube and runs `LLMP` or
+`LLM`.
+
+### Size / quality trade-off (the first, Small-sized sweep)
 
 All runs used the same corpus and 8,000 float steps plus 2,000 QAT steps.
 Bits per character on held-out text:
@@ -133,9 +189,9 @@ marginally better, but head size 6 doesn't suit the 6502 code.
   with fixed seeds, temperatures, top-k values and a prompt, then compares
   every sampled character (and, with `HOOK=1`, the 47 logits behind each one).
 
-Where the time goes (profiled in jsbeeb): 69% multiply-accumulate inner loop,
-6% attention bookkeeping, 6% shifts, 4% OS interrupts, 3.5% division, 3%
-norms, the rest sampling and display.
+Where the time goes (Small, profiled in jsbeeb): 69% multiply-accumulate inner
+loop, 6% shifts, 5% OS (interrupts and screen output), 5% attention
+bookkeeping, 3.5% division, 3% norms, the rest sampling and display.
 
 ## Train it on your own book
 
@@ -144,7 +200,7 @@ on your PATH.
 
 ```sh
 cp ~/books/hitchhikers.txt corpus/hhgttg.txt     # your own copy, plain text
-./retrain.sh                                     # ~5-10 minutes on a laptop CPU
+./retrain.sh                                     # all four sizes, ~30 minutes on an 8-core CPU
 ```
 
 `retrain.sh` uses `corpus/hhgttg.txt` when it exists, otherwise it downloads
@@ -155,10 +211,12 @@ then with quantisation-aware training that simulates the Beeb's integer maths
 checks the integer model, exports the Beeb layout
 ([`tools/export_beeb.py`](tools/export_beeb.py)), assembles the disc and builds
 the MMFS image. Any plain-text file works: `./retrain.sh path/to/book.txt`.
-`QUICK=1 ./retrain.sh` does a two-minute run to test the pipeline.
+`QUICK=1 ./retrain.sh` does a short run to test the pipeline, and
+`SIZES="tiny small" ./retrain.sh` retrains only some sizes. The four sizes
+train side by side and all go on the one disc.
 
 **Copyright:** neither corpora nor weights trained on them are committed. Only
-the public-domain stand-in model (`models/standin.npz`) is in the repository
+the public-domain stand-in models (`models/standin-*.npz`) are in the repository
 and on the web page. A model trained on your own book is written to `build/`
 only (`build/beeb-llm.ssd`, `build/BEEB-LLM.MMB.zip`) for your own machines.
 
@@ -176,9 +234,12 @@ To rebuild the shipped disc from the committed weights without training:
   `perl vendor/MMB_Utils/dput_ssd.pl -f BEEB.MMB 4 discs/beeb-llm.ssd`, then
   on the Beeb `*DIN 4` and SHIFT+BREAK (or `*RUN LLM`).
 
-It needs a plain Model B with DFS or MMFS (PAGE = &1900). It uses the
-RS423/cassette buffers, soft-key buffer and user-character area
-(&0900–&0CFF) for its multiply table, so soft keys are cleared on exit.
+It needs a Model B with DFS or MMFS (PAGE = &1900); a 6502 Second Processor
+is used if present. On the Model B it uses the RS423/cassette buffers,
+soft-key buffer and user-character area (&0900–&0CFF) for its multiply table,
+so soft keys are cleared on exit. Sideways RAM and Master shadow RAM are
+detected by neither build: the Model B build keeps the 17K model as its
+biggest, and a second processor is the way to run the larger ones.
 
 ## Building and testing
 
@@ -190,13 +251,17 @@ test/run-all.sh                          # bit-exact check, boot/quit checks, br
 node test/browser.mjs https://bobstrogg.github.io/beeb-llm/   # the live site
 ```
 
-* `test/verify.mjs [N]`: headless jsbeeb, six fixed cases (various seeds,
-  temperatures 0.5–1.2, top-k off/1/5/10/20 and a typed prompt), compares N
-  tokens with the Python reference and reports cycles per token.
-* `test/boot.mjs`: SHIFT+BREAK autoboot, Q and ESCAPE back to a working BASIC
-  (immediate mode and a program), `*RUN LLM` and `*LLM`.
-* `test/browser.mjs`: the web page in headless Chrome, including the prompt
-  box and buttons.
+* `test/verify.mjs [N]`: headless jsbeeb on a Model B and on a Model B +
+  6502 Second Processor, every model that fits, six fixed cases each (various
+  seeds, temperatures 0.5–1.2, top-k off/1/5/10/20 and a typed prompt);
+  compares N tokens with the Python reference and measures characters per
+  second (`HOOK=1` compares the logits too).
+* `test/boot.mjs`: on both machines, SHIFT+BREAK to the menu and the auto-picked
+  default, M back to the menu, Q, ESCAPE and Q-in-the-menu back to a working
+  BASIC, `*RUN LLM`/`*LLM` (`LLMP` on the second processor). Screenshots in
+  `screenshots/`.
+* `test/browser.mjs`: the web page in headless Chrome for both machines,
+  including the prompt box and buttons.
 * `test/profile.mjs`: cycle profile by routine.
 
 BeebAsm was built from `vendor/beebasm-src`. The web page uses a prebuilt
@@ -204,8 +269,7 @@ jsbeeb in `web/jsbeeb` and is deployed by `.github/workflows/pages.yml`.
 
 ## Possible next steps
 
-* A bigger model for the 6502 Second Processor (64K: about 3× the parameters),
-  or streaming weights from disc.
+* Streaming weights from disc or sideways RAM for still bigger models.
 * 4-bit weights with per-column multiple tables: roughly twice the parameters
   in the same memory, at a similar speed.
 

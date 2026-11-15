@@ -80,6 +80,10 @@ Click the emulator to give it the keyboard.</div>
   </table>
 </div>
 <table id="models"><tr><th>model</th><th>params</th><th>shape</th><th>bits/char</th><th>chars/s Model B</th><th>chars/s 2P</th></tr>
+<tr><td>Tiny</td><td>10,447</td><td>2 × d24, MLP 48</td><td>2.33</td><td>2.35</td><td>3.59</td></tr>
+<tr><td>Small</td><td>16,975</td><td>2 × d32, MLP 64</td><td>2.22</td><td>1.57</td><td>2.40</td></tr>
+<tr><td>Medium</td><td>34,639</td><td>2 × d48, MLP 96</td><td>2.05</td><td>doesn't fit</td><td>1.32</td></tr>
+<tr><td>Large</td><td>49,679</td><td>3 × d48, MLP 96</td><td>2.00</td><td>doesn't fit</td><td>0.92</td></tr>
 <!--MODELS--></table>
 <p class="note">The status line shows the temperature, top-k and the measured speed in characters (tokens) per second.
 The model only knows lower case; the Beeb capitalises sentences and a lone "i" as it types.</p>
