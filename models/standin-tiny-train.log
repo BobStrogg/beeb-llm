@@ -1,0 +1,26 @@
+corpus 728018 symbols, model 10447 params, cfg {'d': 24, 'H': 3, 'L': 2, 'F': 48, 'T': 32, 'V': 47, 'hd': 8}
+float training
+  float     0 loss 5.843 bpc  val 5.833 bpc  0s
+  float  1000 loss 2.582 bpc  val 2.620 bpc  15s
+  float  2000 loss 2.506 bpc  val 2.534 bpc  30s
+  float  3000 loss 2.501 bpc  val 2.502 bpc  45s
+  float  4000 loss 2.421 bpc  val 2.474 bpc  60s
+  float  5000 loss 2.484 bpc  val 2.452 bpc  73s
+  float  6000 loss 2.373 bpc  val 2.444 bpc  87s
+  float  7000 loss 2.398 bpc  val 2.426 bpc  101s
+  float  8000 loss 2.448 bpc  val 2.420 bpc  116s
+  float  9000 loss 2.286 bpc  val 2.406 bpc  129s
+  float 10000 loss 2.356 bpc  val 2.397 bpc  143s
+  float 11000 loss 2.342 bpc  val 2.390 bpc  157s
+  float 12000 loss 2.358 bpc  val 2.380 bpc  172s
+  float 13000 loss 2.246 bpc  val 2.378 bpc  187s
+  float 13999 loss 2.299 bpc  val 2.377 bpc  202s
+scales {"ar": 10, "l0": {"aq": 5, "ak": 6, "av": 5, "ah": 5}, "l1": {"aq": 4, "ak": 5, "av": 5, "ah": 5}} rmax 5.58
+weight-bit caps {"emb": 99, "l0.wq": 7, "l0.wk": 8, "l0.wv": 7, "l0.wo": 8, "l0.w1": 6, "l0.w2": 7, "l1.wq": 6, "l1.wk": 7, "l1.wv": 7, "l1.wo": 7, "l1.w1": 6, "l1.w2": 6, "out": 4}
+QAT
+  qat     0 loss 2.421 bpc  val 2.423 bpc  0s
+  qat  1000 loss 2.299 bpc  val 2.420 bpc  28s
+  qat  2000 loss 2.360 bpc  val 2.412 bpc  55s
+  qat  2999 loss 2.370 bpc  val 2.407 bpc  83s
+val bpc: float 2.377  qat 2.407
+wrote build/final/tiny.npz

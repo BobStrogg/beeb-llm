@@ -22,26 +22,45 @@
       padding: 8px 12px; min-height: 40px; touch-action: none; -webkit-user-select:none; user-select:none; cursor:pointer; }
   .keys button.on { background:#06c; }
   .keys button b { color:#ff0; }
+  .machine { display:flex; flex-wrap:wrap; gap:6px; margin: 0 0 8px; }
+  .machine a { font-size:15px; color:#fff; background:#222; border:1px solid #555; border-radius:6px; padding:8px 12px; text-decoration:none; }
+  .machine a.sel { background:#06c; border-color:#39f; }
+  #models td { padding-right:14px; } #models th { color:#ff0; text-align:left; padding-right:14px; font-weight:normal; }
   #promptform { display:flex; gap:6px; margin-top:8px; }
   #prompt { flex:1; font: inherit; font-size:16px; background:#111; color:#0ff; border:1px solid #555; border-radius:6px; padding:8px; min-width:0; }
 </style>
 </head>
 <body>
 <h1>BEEB-LLM</h1>
-<div class="note"><b>A transformer language model running on a 1981 BBC Micro Model B.</b>
-A 17K-parameter character-level transformer (2 layers, 4 heads, 32-character context, int8 weights) trained on a public-domain stand-in (Jerome K. Jerome's <i>Three Men in a Boat</i> and <i>Three Men on the Bummel</i>) types out new text at about 1.6 characters a second.
-It runs in pure 6502 machine code in <a href="https://github.com/mattgodbolt/jsbeeb">jsbeeb</a> (BBC B, DFS 1.2), booted with SHIFT+BREAK.
+<div class="note"><b>A transformer language model running on a 1981 BBC Micro.</b>
+Character-level transformers from 10K to 50K parameters (int8 weights, a 32-character sliding context) trained on a public-domain stand-in (Jerome K. Jerome's <i>Three Men in a Boat</i> and <i>Three Men on the Bummel</i>) type out new text, in pure 6502 machine code, in <a href="https://github.com/mattgodbolt/jsbeeb">jsbeeb</a>.
+At boot it looks for a 6502 Second Processor, shows a menu of the models that fit, and starts the best one after five seconds: the 17K "Small" model on a plain Model B (about 1.6 characters a second), the 35K "Medium" one on a second processor.
 Click the emulator to give it the keyboard.</div>
+<div class="machine" id="machine">
+  <a href="?" data-tube="0">Model B</a>
+  <a href="?machine=2p" data-tube="1">Model B + 6502 Second Processor</a>
+</div>
 <div class="wrap">
   <div id="stage">
-    <iframe id="beeb" src="jsbeeb/index.html?model=B-DFS1.2&amp;disc=beeb-llm.ssd&amp;autoboot&amp;embed" allow="autoplay; fullscreen" onload="this.contentWindow.focus()"></iframe>
+    <iframe id="beeb" src="about:blank" allow="autoplay; fullscreen" onload="this.contentWindow.focus()"></iframe>
     <div class="keys">
       <button data-code="Space" data-key=" "><b>SPACE</b> new</button>
       <button data-code="Comma" data-key=","><b>&lt;</b> cooler</button>
       <button data-code="Period" data-key="."><b>&gt;</b> hotter</button>
       <button data-code="KeyK" data-key="k"><b>K</b> top-k</button>
       <button data-code="KeyP" data-key="p"><b>P</b> pause</button>
+      <button data-code="KeyM" data-key="m"><b>M</b> models</button>
       <button data-code="KeyQ" data-key="q"><b>Q</b> quit</button>
+    </div>
+    <div class="keys" id="menukeys">
+      <span style="align-self:center;color:#aaa">menu:</span>
+      <button data-code="Digit1" data-key="1"><b>1</b></button>
+      <button data-code="Digit2" data-key="2"><b>2</b></button>
+      <button data-code="Digit3" data-key="3"><b>3</b></button>
+      <button data-code="Digit4" data-key="4"><b>4</b></button>
+      <button data-code="ArrowUp" data-key="ArrowUp"><b>&uarr;</b></button>
+      <button data-code="ArrowDown" data-key="ArrowDown"><b>&darr;</b></button>
+      <button data-code="Enter" data-key="Enter"><b>RETURN</b> start</button>
     </div>
     <form id="promptform" autocomplete="off">
       <input id="prompt" maxlength="36" placeholder="start it off with a prompt…" enterkeyhint="go">
@@ -54,14 +73,25 @@ Click the emulator to give it the keyboard.</div>
     <tr><td>&lt; &gt; (or , .)</td><td>temperature down / up: 0.3 0.5 0.6 0.7 0.8 0.9 1.0 1.1 1.2 1.5</td></tr>
     <tr><td>K</td><td>top-k: off, 1 (greedy), 3, 5, 10, 20</td></tr>
     <tr><td>P</td><td>pause / resume</td></tr>
-    <tr><td>Q / ESCAPE</td><td>quit to BASIC (type <code>*RUN LLM</code> to start again)</td></tr>
-    <tr><td colspan="2"><a href="jsbeeb/index.html?model=B-DFS1.2&amp;disc=beeb-llm.ssd&amp;autoboot">Open in the full jsbeeb UI</a> &middot;
+    <tr><td>M</td><td>back to the model menu (1-4 or cursor keys, RETURN)</td></tr>
+    <tr><td>Q / ESCAPE</td><td>quit to BASIC (<code>*RUN LLM</code>, or <code>*RUN LLMP</code> on the second processor, to start again)</td></tr>
+    <tr><td colspan="2"><a id="fullui" href="jsbeeb/index.html?model=B-DFS1.2&amp;disc=beeb-llm.ssd&amp;autoboot">Open in the full jsbeeb UI</a> &middot;
       <a href="jsbeeb/discs/beeb-llm.ssd" download>Download beeb-llm.ssd</a></td></tr>
   </table>
 </div>
+<table id="models"><tr><th>model</th><th>params</th><th>shape</th><th>bits/char</th><th>chars/s Model B</th><th>chars/s 2P</th></tr>
+<!--MODELS--></table>
 <p class="note">The status line shows the temperature, top-k and the measured speed in characters (tokens) per second.
 The model only knows lower case; the Beeb capitalises sentences and a lone "i" as it types.</p>
 <p class="note">Source, the training pipeline, discs and an MMFS image: <a href="https://github.com/BobStrogg/beeb-llm">github.com/BobStrogg/beeb-llm</a></p>
+<script>
+  // which machine: ?machine=2p adds the 6502 Second Processor (jsbeeb's coProcessor option)
+  const tube = new URLSearchParams(location.search).get("machine") === "2p";
+  const q = "model=B-DFS1.2&disc=beeb-llm.ssd&autoboot" + (tube ? "&coProcessor=true" : "");
+  document.getElementById("beeb").src = "jsbeeb/index.html?" + q + "&embed";
+  document.getElementById("fullui").href = "jsbeeb/index.html?" + q;
+  for (const a of document.querySelectorAll("#machine a")) a.classList.toggle("sel", (a.dataset.tube === "1") === tube);
+</script>
 <script src="keys.js"></script>
 </body>
 </html>

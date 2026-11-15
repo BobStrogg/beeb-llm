@@ -12,7 +12,7 @@ from prepare_corpus import VOCAB
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--corpus", default="build/corpus.txt")
-ap.add_argument("--d", type=int, default=32); ap.add_argument("--H", type=int, default=4)
+ap.add_argument("--d", type=int, default=32); ap.add_argument("--H", type=int, default=0)   # 0: d/8 (the Beeb wants heads of 8)
 ap.add_argument("--L", type=int, default=2); ap.add_argument("--F", type=int, default=64)
 ap.add_argument("--T", type=int, default=64)
 ap.add_argument("--steps", type=int, default=8000); ap.add_argument("--qat-steps", type=int, default=3000)
@@ -28,7 +28,7 @@ stoi = {ch: i for i, ch in enumerate(VOCAB)}
 data = torch.tensor([stoi[ch] for ch in text if ch in stoi], dtype=torch.long)
 n = len(data); nval = n // 20
 train, val = data[:-nval], data[-nval:]
-c = Cfg(d=args.d, H=args.H, L=args.L, F=args.F, T=args.T, V=len(VOCAB))
+c = Cfg(d=args.d, H=args.H or args.d // 8, L=args.L, F=args.F, T=args.T, V=len(VOCAB))
 S = 2 * c.T
 model = TinyLM(c)
 print(f"corpus {n} symbols, model {model.nparams()} params, cfg {c.as_dict()}", flush=True)

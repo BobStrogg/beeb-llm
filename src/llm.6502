@@ -1,55 +1,70 @@
 \ ============================================================================
-\  BEEB-LLM: a character-level transformer language model for the BBC Micro
-\  Model B (6502 @ 2MHz, 32K, OS 1.20), running in MODE 7.
+\  BEEB-LLM: a character-level transformer language model for the BBC Micro.
+\
+\  One source, two builds (see build.sh):
+\    PARASITE = 0   "LLM"  + "MENU"   runs in the Model B itself (code at &1900)
+\    PARASITE = 1   "LLMP" + "MENUP"  runs in a 6502 Second Processor across the
+\                                     Tube (code at &0800, ~52K for the model)
+\  The models (M0..M3, written by tools/export_beeb.py) are relocatable files
+\  with a header giving their shape; the boot menu overlay is loaded into the
+\  model area, picks one, and the engine then loads it there.
 \
 \  Pure integer inference, bit-exact with tools/intref.py:
 \    * int8 weights and activations, 16-bit accumulators
 \    * 8x8 signed multiply from a quarter-square table: a*w = f(a+w) - f(w-a),
-\      f(n) = n*n/4, 512-entry table at &0900-&0CFF (low bytes / high bytes)
+\      f(n) = n*n/4, 512-entry table (low bytes / high bytes)
 \    * table RMSNorm, table exp() softmax, multi-query attention over a ring
 \      buffer KV cache (sliding window of CTX characters), ReLU MLP
 \    * temperature + top-k sampling from a xorshift16 generator
-\  Assemble with BeebAsm (see build.sh).
+\  All screen output goes through OSWRCH, so it works across the Tube.
 \ ============================================================================
 
-INCLUDE "../build/model_consts.6502"
-ASSERT D = 32 AND HD = 8 AND NH * HD = D AND (CTX = 32 OR CTX = 64)
+OSWRCH = &FFEE : OSBYTE = &FFF4 : OSWORD = &FFF1 : OSRDCH = &FFE0 : OSFILE = &FFDD : OSCLI = &FFF7
+HD = 8               \ head size (fixed); D, NL, FF, CTX, NV come from the model header
+EXP_LEN = 64
 
-OSWRCH = &FFEE : OSBYTE = &FFF4 : OSWORD = &FFF1 : OSRDCH = &FFE0 : OSNEWL = &FFE7
-
-\ ---- quarter-square table: f(n) for n = -256..255
-SQL = &0900          \ low bytes, f(n) at &0A00+n
-SQH = &0B00          \ high bytes, f(n) at &0C00+n
-
-\ ---- zero page (BASIC's &00-&7F is saved on entry and put back on exit)
-ACCL = &00           \ 64 accumulators, low bytes
-ACCH = &40           \ ... high bytes
+\ ---- zero page
 PL = &80 : PH = &82 : QL = &84 : QH = &86     \ multiply pointers (high bytes fixed)
 TL = &88
 ZA = &89 : ZB = &8A : ZC = &8B : ZD = &8C
-SCR = &8D            \ 2-byte screen pointer
 ZE = &8F
 
-SCREEN = &7C00
-WTOP = 4 : WBOT = 22 \ text window rows (columns 1..39; column 0 holds the colour)
-HDR_COLOUR = &83
-
-ORG &1900
-GUARD &7C00
+IF PARASITE
+    ORG &0800
+    MEMTOP = &F800   \ the Tube client OS lives above this
+    MAXROWS = 128    \ ACC arrays in main memory
+    ADDRHI = &00     \ OSFILE: parasite memory
+    SQL = &0400 : SQH = &0600     \ BASIC is not used, so its workspace holds the table
+ELSE
+    ORG &1900
+    MEMTOP = &7C00   \ MODE 7 screen
+    MAXROWS = 64     \ ACC arrays in zero page
+    ADDRHI = &FF     \ OSFILE: I/O processor memory
+    SQL = &0900 : SQH = &0B00     \ f(n) at SQL+&100+n, n = -256..255
+    ACCL = &00 : ACCH = &40       \ (BASIC's zero page: BASIC is restarted on exit)
+ENDIF
+GUARD MEMTOP
 
 .start
     JMP main
 
 \ ---- screen text (defined early: macro arguments cannot be forward references)
-.s_title EQUB &84, &9D, &83, &8D : EQUS "            DON'T PANIC             ", 0
-.s_sub   EQUB &86 : EQUS "BEEB-LLM", &87, '0' + NPARAMS_K DIV 10, '0' + NPARAMS_K MOD 10
-         EQUS "K-param transformer, 6502", 0
-.s_status EQUB &83 : EQUS "Temp 0.0 ", &82 : EQUS "Top-k --", &86 : EQUS "0.00 tok/s", &85 : EQUS "        ", 0
+.s_title EQUB &84, &9D, &83, &8D : EQUS "            DON'T PANIC            ", 0
+.s_sub   EQUB &86 : EQUS "BEEB-LLM", &87, 0
+IF PARASITE
+.s_mach  EQUB &82 : EQUS "6502 2P", 0
+ELSE
+.s_mach  EQUB &82 : EQUS "Model B", 0
+ENDIF
+.s_status EQUB &83 : EQUS "Temp 0.0 ", &82 : EQUS "Top-k --", &86 : EQUS "0.00 tok/s        ", 0
 .s_paused EQUB &81 : EQUS "PAUSED", 0
-.s_help  EQUB &86 : EQUS "SPACE", &87 : EQUS "new", &86 : EQUS "< >", &87 : EQUS "temperature", &86 : EQUS "K", &87 : EQUS "top-k", 0
+.s_unpaused EQUS "       ", 0
+.s_help  EQUB &86 : EQUS "SPACE", &87 : EQUS "new", &86 : EQUS "<>", &87 : EQUS "temp", &86 : EQUS "K", &87 : EQUS "top-k", &86 : EQUS "M", &87 : EQUS "models", 0
 .s_idle  EQUB &82 : EQUS "RETURN prompt  P pause  Q quit         ", 0
-.s_prompt EQUB &83 : EQUS "> ", &87 : EQUS "                                     ", 0
-
+.s_prompt EQUB &83 : EQUS "> ", &87 : EQUS "                                    ", 0
+.v_window EQUB 28, 1, 22, 39, 4, 0             \ text window: columns 1..39, rows 4..22
+.v_curon  EQUB 23, 1, 1, 0, 0, 0, 0, 0, 0, 0, 255
+.v_curoff EQUB 23, 1, 0, 0, 0, 0, 0, 0, 0, 0, 255
 
 \ ============================================================================
 \  multiply / accumulate core
@@ -177,7 +192,7 @@ ENDMACRO
 \ resadd: R[i] += ACC[i] >> rs (rs signed: negative = shift left)
 .resadd
 {
-    LDX #D-1
+    LDX dm1
 .lp LDA ACCL,X : STA ZA : LDA ACCH,X : STA ZB
     LDA rs : BMI left
     TAY : JSR asr : JMP add
@@ -196,7 +211,7 @@ ENDMACRO
 {
     \ max |R|
     LDA #0 : STA ZC : STA ZD
-    LDX #D-1
+    LDX dm1
 .mx LDA RL,X : STA ZA : LDA RH,X : STA ZB
     BPL p
     SEC : LDA #0 : SBC ZA : STA ZA : LDA #0 : SBC ZB : STA ZB
@@ -208,7 +223,7 @@ ENDMACRO
     LDA ZC : BMI big
     BNE small
     \ all zero -> X8 = 0
-    LDX #D-1 : LDA #0
+    LDX dm1 : LDA #0
 .z  STA X8,X : DEX : BPL z
     RTS
 .big
@@ -216,7 +231,7 @@ ENDMACRO
 .bs INY : LSR ZD : ROR ZC
     LDA ZD : BNE bs : LDA ZC : BMI bs
     STY ZE                  \ shift right by ZE
-    LDX #D-1
+    LDX dm1
 .bx LDA RL,X : STA ZA : LDA RH,X : STA ZB
     LDY ZE : JSR asr
     LDA ZA : STA X8,X
@@ -226,14 +241,14 @@ ENDMACRO
     LDY #0 : LDA ZC
 .ss CMP #64 : BCS sd : ASL A : INY : BNE ss
 .sd STY ZE
-    LDX #D-1
+    LDX dm1
 .sx LDA RL,X : LDY ZE : BEQ sn
 .sy ASL A : DEY : BNE sy
 .sn STA X8,X : DEX : BPL sx
 .sumsq
     \ ss = sum x8^2  (24-bit in ZA ZB ZC), using f(2x) = x^2
     LDA #0 : STA ZA : STA ZB : STA ZC
-    LDX #D-1
+    LDX dm1
 .q  LDA X8,X : ASL A : TAY
     BCS qn
     LDA SQL+&100,Y : CLC : ADC ZA : STA ZA
@@ -244,13 +259,14 @@ ENDMACRO
     BCC qd : INC ZC
 .qd DEX : BPL q
     \ normalise: while ss >= 256: ss >>= 2, e++
-    LDY #NK
+    LDY m_nk
 .ne LDA ZB : ORA ZC : BEQ nd
     LSR ZC : ROR ZB : ROR ZA
     LSR ZC : ROR ZB : ROR ZA
     INY : BNE ne
 .nd STY nm_sh
-    LDX ZA : LDA rtab-64,X : STA nm_r
+    LDX ZA
+.^nm_rtab LDA &FFFF,X : STA nm_r     \ the model's 1/sqrt table - 64 (patched by load_model)
     \ rounding constant 1 << (sh-1)
     LDA #0 : STA nm_rl : STA nm_rh
     DEY : TYA : CMP #8 : BCS rh
@@ -262,7 +278,7 @@ ENDMACRO
 .rh2 STA nm_rh
 .rd
     LDA #&81 : STA rq_lo
-    LDX #D-1
+    LDX dm1
 .y  STX ZE
     LDA X8,X : STA ZA
     LDA nm_r : JSR mul8
@@ -291,15 +307,15 @@ ENDMACRO
 .ks STA &FFFF
     LDA VB,X : EOR #&80
 .vs STA &FFFF
-    LDA kp : CLC : ADC #CTX : STA kp : BCC s1 : INC kp+1
-.s1 LDA vp : CLC : ADC #CTX : STA vp : BCC s2 : INC vp+1
+    LDA kp : CLC : ADC m_ctx : STA kp : BCC s1 : INC kp+1
+.s1 LDA vp : CLC : ADC m_ctx : STA vp : BCC s2 : INC vp+1
 .s2 INX : CPX #HD : BNE st
     \ ---- patch the 8 V-column loads for this layer
     LDA ly_vc : STA vp : LDA ly_vc+1 : STA vp+1
     LDX #0
 .pv LDA vpatch_lo,X : STA ZA : LDA vpatch_hi,X : STA ZB
     LDY #1 : LDA vp : STA (ZA),Y : INY : LDA vp+1 : STA (ZA),Y
-    LDA vp : CLC : ADC #CTX : STA vp : BCC pv1 : INC vp+1
+    LDA vp : CLC : ADC m_ctx : STA vp : BCC pv1 : INC vp+1
 .pv1 INX : CPX #HD : BNE pv
     LDA #0 : STA head
 .headlp
@@ -312,20 +328,18 @@ ENDMACRO
 .qk LDX qj : LDA QB,X : BEQ qk0
     LDX nvis : DEX
     JSR colmac
-.qk0 LDA colw+1 : CLC : ADC #CTX : STA colw+1 : BCC qk1 : INC colw+2
+.qk0 LDA colw+1 : CLC : ADC m_ctx : STA colw+1 : BCC qk1 : INC colw+2
 .qk1 INC qj : DEC jcnt : BNE qk
     \ ---- s = (acc >> SQK) - rb[h][(slot - t) & (CTX-1)], track max
-    LDA head : ASL A : ASL A : ASL A : ASL A : ASL A   \ head*CTX (CTX = 32)
-IF CTX = 64
-    ASL A
-ENDIF
-    CLC : ADC ly_rb : STA rbp+1 : LDA ly_rb+1 : ADC #0 : STA rbp+2
+    LDA head : STA ZC : LDA #0 : STA ZD : LDX m_ctxb    \ head*CTX (16-bit)
+.hc ASL ZC : ROL ZD : DEX : BNE hc
+    LDA ZC : CLC : ADC ly_rb : STA rbp+1 : LDA ZD : ADC ly_rb+1 : STA rbp+2
     LDA #&00 : STA mxl : LDA #&80 : STA mxh   \ -32768
     LDX nvis : DEX
 .sc STX ZE
     LDA ACCL,X : STA ZA : LDA ACCH,X : STA ZB
     LDY ly_sqk : JSR asr
-    LDA slot : SEC : SBC ZE : AND #CTX-1 : TAY
+    LDA slot : SEC : SBC ZE : AND ctxm1 : TAY
 .rbp LDA &FFFF,Y
     STA ZC : LDA #0 : BIT ZC : BPL rb1 : LDA #&FF
 .rb1 STA ZD
@@ -383,7 +397,7 @@ VBLK = (vnext - vc0) DIV HD
     JSR sdiv
     LDX qj : STA OB,X : INC qj
     LDX jcnt : INX : CPX #HD : BNE dv
-    INC head : LDA head : CMP #NH : BEQ done : JMP headlp
+    INC head : LDA head : CMP m_nh : BEQ done : JMP headlp
 .done
     RTS
 .vpatch_lo
@@ -429,26 +443,26 @@ NEXT
 {
     STA tok
     \ ---- embedding: R = E[tok] << EMB_SHIFT
-    LDA #0 : STA ZB : LDA tok
-    LDX #5 : STX ZC            \ tok * 32 (D = 32)
-.m  ASL A : ROL ZB : DEC ZC : BNE m
-    CLC : ADC #LO(emb) : STA ep+1 : LDA ZB : ADC #HI(emb) : STA ep+2
-    LDX #D-1
+    LDA m_embp : STA ep+1 : LDA m_embp+1 : STA ep+2
+    LDX tok : BEQ m0
+.m  LDA ep+1 : CLC : ADC m_d : STA ep+1 : BCC m1 : INC ep+2   \ + tok * D
+.m1 DEX : BNE m
+.m0 LDX dm1
 .ep LDA &FFFF,X : STA ZA
     LDA #0 : BIT ZA : BPL e1 : LDA #&FF
 .e1 STA ZB
-    LDY #EMB_SHIFT
+    LDY m_emb
 .e2 CPY #0 : BEQ e3 : ASL ZA : ROL ZB : DEY : JMP e2
 .e3 LDA ZA : STA RL,X : LDA ZB : STA RH,X
     DEX : BPL ep
     \ ---- ring buffer slot and visible count
-    LDA posl : AND #CTX-1 : STA slot
-    LDA posh : BNE full : LDA posl : CMP #CTX : BCS full
+    LDA posl : AND ctxm1 : STA slot
+    LDA posh : BNE full : LDA posl : CMP m_ctx : BCS full
     ADC #1 : STA nvis : JMP lay
-.full LDA #CTX : STA nvis
+.full LDA m_ctx : STA nvis
 .lay
     LDA #0 : STA layer
-    LDA #LO(layer_tab) : STA ltp : LDA #HI(layer_tab) : STA ltp+1
+    LDA #LO(MODEL+20) : STA ltp : LDA #HI(MODEL+20) : STA ltp+1
 .layer_lp
     \ copy this layer's table entry
     LDA ltp : STA lt+1 : LDA ltp+1 : STA lt+2
@@ -459,20 +473,20 @@ NEXT
     LDA ly_qkv_w : STA mv_w : LDA ly_qkv_w+1 : STA mv_w+1
     LDA ly_qkv_b : STA mv_b : LDA ly_qkv_b+1 : STA mv_b+1
     LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
-    LDA #D+2*HD : STA mv_rows : LDA #D : STA mv_cols
+    LDA dp16 : STA mv_rows : LDA m_d : STA mv_cols
     JSR matvec
     LDA #&81 : STA rq_lo
-    LDA #0 : STA rq_src : LDA #D : STA rq_n : LDA ly_sq : STA rq_s
+    LDA #0 : STA rq_src : LDA m_d : STA rq_n : LDA ly_sq : STA rq_s
     LDA #LO(QB) : STA rq_dst : LDA #HI(QB) : STA rq_dst+1 : JSR requant
-    LDA #D : STA rq_src : LDA #HD : STA rq_n : LDA ly_sk : STA rq_s
+    LDA m_d : STA rq_src : LDA #HD : STA rq_n : LDA ly_sk : STA rq_s
     LDA #LO(KB) : STA rq_dst : LDA #HI(KB) : STA rq_dst+1 : JSR requant
-    LDA #D+HD : STA rq_src : LDA ly_sv : STA rq_s
+    LDA dp8 : STA rq_src : LDA ly_sv : STA rq_s
     LDA #LO(VB) : STA rq_dst : LDA #HI(VB) : STA rq_dst+1 : JSR requant
     JSR attention
     LDA ly_o_w : STA mv_w : LDA ly_o_w+1 : STA mv_w+1
     LDA ly_o_b : STA mv_b : LDA ly_o_b+1 : STA mv_b+1
     LDA #LO(OB) : STA mv_x : LDA #HI(OB) : STA mv_x+1
-    LDA #D : STA mv_rows : STA mv_cols
+    LDA m_d : STA mv_rows : STA mv_cols
     JSR matvec
     LDA ly_so : STA rs : JSR resadd
     \ ---- MLP sub-block
@@ -480,30 +494,30 @@ NEXT
     LDA ly_f1_w : STA mv_w : LDA ly_f1_w+1 : STA mv_w+1
     LDA ly_f1_b : STA mv_b : LDA ly_f1_b+1 : STA mv_b+1
     LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
-    LDA #FF : STA mv_rows : LDA #D : STA mv_cols
+    LDA m_ff : STA mv_rows : LDA m_d : STA mv_cols
     JSR matvec
-    LDA #0 : STA rq_lo : STA rq_src : LDA #FF : STA rq_n : LDA ly_s1 : STA rq_s
+    LDA #0 : STA rq_lo : STA rq_src : LDA m_ff : STA rq_n : LDA ly_s1 : STA rq_s
     LDA #LO(HB) : STA rq_dst : LDA #HI(HB) : STA rq_dst+1 : JSR requant
     LDA ly_f2_w : STA mv_w : LDA ly_f2_w+1 : STA mv_w+1
     LDA ly_f2_b : STA mv_b : LDA ly_f2_b+1 : STA mv_b+1
     LDA #LO(HB) : STA mv_x : LDA #HI(HB) : STA mv_x+1
-    LDA #D : STA mv_rows : LDA #FF : STA mv_cols
+    LDA m_d : STA mv_rows : LDA m_ff : STA mv_cols
     JSR matvec
     LDA ly_s2 : STA rs : JSR resadd
     \ next layer
     LDA ltp : CLC : ADC #LAYER_TAB_SIZE : STA ltp : BCC nl : INC ltp+1
-.nl INC layer : LDA layer : CMP #NL : BEQ ld : JMP layer_lp
+.nl INC layer : LDA layer : CMP m_nl : BEQ ld : JMP layer_lp
 .ld INC posl : BNE pd : INC posh
 .pd LDA want_lu : BEQ out
     \ ---- head: LU = clamp((Wout * norm(R) + b) >> SL)
     JSR norm
-    LDA #LO(out_w) : STA mv_w : LDA #HI(out_w) : STA mv_w+1
-    LDA #LO(out_bl) : STA mv_b : LDA #HI(out_bl) : STA mv_b+1
+    LDA m_outw : STA mv_w : LDA m_outw+1 : STA mv_w+1
+    LDA m_outb : STA mv_b : LDA m_outb+1 : STA mv_b+1
     LDA #LO(X8) : STA mv_x : LDA #HI(X8) : STA mv_x+1
-    LDA #NV : STA mv_rows : LDA #D : STA mv_cols
+    LDA m_nv : STA mv_rows : LDA m_d : STA mv_cols
     JSR matvec
     LDA #&81 : STA rq_lo
-    LDA #0 : STA rq_src : LDA #NV : STA rq_n : LDA #SL : STA rq_s
+    LDA #0 : STA rq_src : LDA m_nv : STA rq_n : LDA m_sl : STA rq_s
     LDA #LO(LU) : STA rq_dst : LDA #HI(LU) : STA rq_dst+1 : JSR requant
 .out RTS
 }
@@ -525,7 +539,7 @@ NEXT
 {
     \ z = (lu * kt) >> 4 into ACC, track max
     LDA #&00 : STA mxl : LDA #&80 : STA mxh
-    LDX #NV-1
+    LDX nvm1
 .z  STX ZE
     LDA LU,X : STA ZA
     LDA kt : JSR mul8
@@ -539,7 +553,7 @@ NEXT
     LDA ACCL,X : STA mxl : LDA ACCH,X : STA mxh
 .nm DEX : BPL z
     \ e = EXP[max - z]
-    LDX #NV-1
+    LDX nvm1
 .ex SEC : LDA mxl : SBC ACCL,X : TAY : LDA mxh : SBC ACCH,X
     BNE e0 : CPY #EXP_LEN : BCS e0
     LDA exptab,Y : JMP e1
@@ -555,16 +569,16 @@ NEXT
     LDY ZC : BMI tb
     LDA EB,X : CMP EB,Y : BCC tn : BEQ tn
 .tb STX ZC
-.tn INX : CPX #NV : BNE tl
+.tn INX : CPX m_nv : BNE tl
     LDX ZC : BMI tz
     LDA #1 : STA KEEP,X
     DEC ZD : BNE tk
-.tz LDX #NV-1
+.tz LDX nvm1
 .tc LDA KEEP,X : BNE tq : STA EB,X
 .tq DEX : BPL tc
 .sum
     LDA #0 : STA esl : STA esh
-    LDX #NV-1
+    LDX nvm1
 .sm LDA EB,X : CLC : ADC esl : STA esl : BCC s1 : INC esh
 .s1 DEX : BPL sm
     \ mask = smallest 2^b-1 >= E-1   (ZC:ZD = E-1, ZA:ZB = mask)
@@ -586,68 +600,63 @@ NEXT
 }
 
 \ ============================================================================
-\  screen: header, status, a scrolling word-wrapped text window with cursor
+\  screen (all through OSWRCH): header, status, a word-wrapped text window
 \ ============================================================================
-TEXT_COLOUR = &87
-CURSOR = &7F               \ solid block
+LINEW = 38           \ characters per line (window is 39 wide: never let the OS wrap)
 
-\ SCR = address of (crow, ccol)
-.scraddr
-    LDX crow
-    LDA rowlo,X : CLC : ADC ccol : STA SCR
-    LDA rowhi,X : ADC #0 : STA SCR+1
-    RTS
-
-.cursor_on
-    LDA ccol : CMP #40 : BCS co
-    JSR scraddr : LDY #0 : LDA #CURSOR : STA (SCR),Y
-.co RTS
-.cursor_off
-    LDA ccol : CMP #40 : BCS co
-    JSR scraddr : LDY #0 : LDA #' ' : STA (SCR),Y
-    RTS
-
-.clear_window
+\ print the 0-terminated string at (ZA,ZB)
+.prstr
 {
-    LDX #WTOP
-.r  LDA rowlo,X : STA SCR : LDA rowhi,X : STA SCR+1
-    LDY #0 : LDA #TEXT_COLOUR : STA (SCR),Y
-    LDA #' '
-.c  INY : STA (SCR),Y : CPY #39 : BNE c
-    INX : CPX #WBOT+1 : BNE r
-    LDA #WTOP : STA crow : LDA #1 : STA ccol
-    LDA #0 : STA wordlen : STA endsent
-    LDA #1 : STA capnext
-    RTS
+    LDY #0
+.l  LDA (ZA),Y : BEQ d
+    JSR OSWRCH : INY : BNE l
+.d  RTS
 }
+\ print a 255-terminated VDU sequence at (ZA,ZB) (may contain zeros)
+.prvdu
+{
+    LDY #0
+.l  LDA (ZA),Y : CMP #255 : BEQ d
+    JSR OSWRCH : INY : BNE l
+.d  RTS
+}
+MACRO SHOW pstr
+    LDA #LO(pstr) : STA ZA : LDA #HI(pstr) : STA ZB : JSR prstr
+ENDMACRO
+MACRO VDUS pstr
+    LDA #LO(pstr) : STA ZA : LDA #HI(pstr) : STA ZB : JSR prvdu
+ENDMACRO
+\ move to column X, row Y
+.tab
+    LDA #31 : JSR OSWRCH : TXA : JSR OSWRCH : TYA : JMP OSWRCH
+.bs_n                \ X backspaces
+    LDA #8 : JSR OSWRCH : DEX : BNE bs_n
+    RTS
+.sp_n                \ X spaces
+    LDA #' ' : JSR OSWRCH : DEX : BNE sp_n
+    RTS
+
+\ go to the full screen, remembering where the text cursor is in the window
+.full_screen
+    LDA #&86 : JSR OSBYTE : STX savex : STY savey
+    LDA #26 : JMP OSWRCH
+\ back to the text window and the remembered position
+.text_window
+    SHOW v_window
+    LDX savex : LDY savey : JMP tab
 
 .newline
-{
-    LDA #1 : STA ccol
-    LDA crow : CMP #WBOT : BEQ scroll
-    INC crow : RTS
-.scroll
-    LDX #WTOP
-.r  LDA rowlo,X : STA cp_d+1 : LDA rowhi,X : STA cp_d+2
-    LDA rowlo+1,X : STA cp_s+1 : LDA rowhi+1,X : STA cp_s+2
-    LDY #39
-.cp_s LDA &FFFF,Y
-.cp_d STA &FFFF,Y
-    DEY : BNE cp_s
-    INX : CPX #WBOT : BNE r
-    LDA rowlo+WBOT : STA SCR : LDA rowhi+WBOT : STA SCR+1
-    LDY #39 : LDA #' '
-.c  STA (SCR),Y : DEY : BNE c
+    LDA #13 : JSR OSWRCH : LDA #10 : JSR OSWRCH
+    LDA #0 : STA ccol
     RTS
-}
 
 \ fix_i: a lone "i" becomes "I"
 .fix_i
 {
     LDA wordlen : CMP #1 : BNE no
-    DEC ccol : JSR scraddr : INC ccol
-    LDY #0 : LDA (SCR),Y : CMP #'i' : BNE no
-    LDA #'I' : STA (SCR),Y
+    LDA wordbuf : CMP #'i' : BNE no
+    LDA #'I' : STA wordbuf
+    LDA #8 : JSR OSWRCH : LDA #'I' : JSR OSWRCH
 .no RTS
 }
 
@@ -655,23 +664,22 @@ CURSOR = &7F               \ solid block
 .putc
 {
     TAX : LDA vocab,X : STA ZE
-    JSR cursor_off
-    LDA ZE : CMP #10 : BNE notnl
+    CMP #10 : BNE notnl
     JSR fix_i
-    LDA ccol : CMP #1 : BEQ nl1
+    LDA ccol : BEQ nl1
     JSR newline
 .nl1 LDA #1 : STA capnext : LDA #0 : STA endsent : STA wordlen
-    JMP cursor_on
+    RTS
 .notnl CMP #' ' : BNE word
     JSR fix_i
     LDA #0 : STA wordlen
     LDA endsent : BEQ sp1 : LDA #1 : STA capnext
 .sp1 LDA #0 : STA endsent
-    LDA ccol : CMP #1 : BEQ sp2
-    CMP #40 : BCC sp3
-    JSR newline : JMP cursor_on
-.sp3 JSR scraddr : LDY #0 : LDA #' ' : STA (SCR),Y : INC ccol
-.sp2 JMP cursor_on
+    LDA ccol : BEQ sp2
+    CMP #LINEW : BCC sp3
+    JMP newline
+.sp3 LDA #' ' : JSR OSWRCH : INC ccol
+.sp2 RTS
 .word
     \ letters: capitalise at the start of a sentence; punctuation: fix lone i
     LDA ZE : CMP #'a' : BCC punct
@@ -687,67 +695,69 @@ CURSOR = &7F               \ solid block
     LDA #0 : STA endsent : JMP place
 .es LDA #1 : STA endsent
 .place
-    LDA ccol : CMP #40 : BCC put
+    LDA ccol : CMP #LINEW : BCC put
     \ line full: carry the current word over to the next line
-    LDA wordlen : BEQ nw : CMP #30 : BCS nw
-    LDA #40 : SEC : SBC wordlen : STA ccol : JSR scraddr
+    LDX wordlen : BEQ nw : CPX #30 : BCS nw
+    JSR bs_n : LDX wordlen : JSR sp_n
+    JSR newline
     LDY #0
-.mv LDA (SCR),Y : STA wordbuf,Y : LDA #' ' : STA (SCR),Y
-    INY : CPY wordlen : BNE mv
-    JSR newline : JSR scraddr
-    LDY #0
-.mv2 LDA wordbuf,Y : STA (SCR),Y : INY : CPY wordlen : BNE mv2
-    TYA : CLC : ADC #1 : STA ccol
+.mv LDA wordbuf,Y : JSR OSWRCH : INY : CPY wordlen : BNE mv
+    STY ccol
     JMP put
 .nw JSR newline
-.put JSR scraddr : LDY #0 : LDA ZE : STA (SCR),Y
-    INC ccol : INC wordlen
-    JMP cursor_on
+.put LDA ZE : JSR OSWRCH
+    LDX wordlen : CPX #39 : BCS pf : STA wordbuf,X : INC wordlen
+.pf INC ccol
+    RTS
 }
-
-\ print a 0-terminated string at (row X, column Y); string pointer in ZA/ZB
-.print_at
-{
-    LDA rowlo,X : STA SCR : LDA rowhi,X : STA SCR+1
-    TYA : CLC : ADC SCR : STA SCR : BCC p : INC SCR+1
-.p  LDY #0
-.l  LDA (ZA),Y : BEQ d : STA (SCR),Y : INY : BNE l
-.d  RTS
-}
-MACRO SHOWSTR prow, pcol, pstr
-    LDA #LO(pstr) : STA ZA : LDA #HI(pstr) : STA ZB
-    LDX #prow : LDY #pcol : JSR print_at
-ENDMACRO
 
 .draw_screen
-    SHOWSTR 0, 0, s_title
-    SHOWSTR 1, 0, s_title
-    SHOWSTR 2, 0, s_sub
-    SHOWSTR 24, 0, s_help
-    JSR show_msg_idle
-    JMP status
+    LDA #26 : JSR OSWRCH : LDA #12 : JSR OSWRCH
+    SHOW s_title : JSR OSNL
+    SHOW s_title : JSR OSNL
+    SHOW s_sub : SHOW mname : SHOW s_mach
+    LDX #0 : LDY #24 : JSR tab : SHOW s_help
+    JSR show_idle
+    JSR status_all
+    SHOW v_window
+    VDUS v_curon
+    RTS
+.OSNL
+    LDA #13 : JSR OSWRCH : LDA #10 : JMP OSWRCH
 
-.show_msg_idle
-    SHOWSTR 23, 0, s_idle
+.show_idle
+    LDX #0 : LDY #23 : JSR tab : SHOW s_idle
     RTS
 
-\ status line (row 3): temperature, top-k, speed, characters generated
-.status
+\ status line (row 3): temperature, top-k, speed; call with the full screen selected
+.status_all
 {
-    SHOWSTR 3, 0, s_status
-    LDX tidx : LDA tstr0,X : STA SCREEN+3*40+6 : LDA tstr1,X : STA SCREEN+3*40+8
-    LDX kidx : LDA kstr0,X : STA SCREEN+3*40+17 : LDA kstr1,X : STA SCREEN+3*40+18
-    \ rate (tok/s * 100) as d.dd
+    LDX #0 : LDY #3 : JSR tab : SHOW s_status
+    LDX #6 : LDY #3 : JSR tab
+    LDX tidx : LDA tstr0,X : JSR OSWRCH : LDA #'.' : JSR OSWRCH : LDA tstr1,X : JSR OSWRCH
+    LDX #17 : LDY #3 : JSR tab
+    LDX kidx : LDA kstr0,X : JSR OSWRCH : LDA kstr1,X : JSR OSWRCH
+    JSR rate_digits
+    LDX #31 : LDY #3 : JSR tab
+    LDA paused : BEQ np
+    SHOW s_paused : RTS
+.np SHOW s_unpaused : RTS
+}
+\ rate (tok/s * 100) as d.dd at row 3, column 20
+.rate_digits
+    LDX #20 : LDY #3 : JSR tab
     LDA ratel : STA n0 : LDA rateh : STA n1
     LDX #0 : JSR digit
-    LDX #1 : JSR digit : STA SCREEN+3*40+20
-    LDA #'.' : STA SCREEN+3*40+21
-    LDX #2 : JSR digit : STA SCREEN+3*40+22
-    LDX #3 : JSR digit : STA SCREEN+3*40+23
-    LDA paused : BEQ np
-    SHOWSTR 3, 31, s_paused
-.np RTS
-}
+    LDX #1 : JSR digit : JSR OSWRCH
+    LDA #'.' : JSR OSWRCH
+    LDX #2 : JSR digit : JSR OSWRCH
+    LDX #3 : JSR digit : JMP OSWRCH
+\ redraw the whole status line / just the speed, from inside the text window
+.status
+    JSR full_screen : JSR status_all : JMP text_window
+.status_rate
+    JSR full_screen : JSR rate_digits : JMP text_window
+
 \ digit: next decimal digit of n1:n0 for the power of ten at X (1000,100,10,1)
 .digit
 {
@@ -829,17 +839,29 @@ ENDMACRO
 
 .main
 {
-    TSX : STX savesp                   \ so quit can return to BASIC from any depth
-    LDX #&7F
-.sv LDA &00,X : STA zsave,X : DEX : BPL sv
+    TSX : STX savesp                   \ so quit / the menu can reset the stack
+    LDA #&77 : JSR OSBYTE              \ close !BOOT's *EXEC file (it would feed us keys)
+    LDA #15 : LDX #1 : JSR osb
     LDA #4 : LDX #1 : JSR osb          \ cursor keys give codes
     LDA #229 : LDX #1 : JSR osb        \ ESCAPE is an ordinary key
-    LDX #0
-.v  LDA vdu_init,X : JSR OSWRCH : INX : CPX #vdu_init_end - vdu_init : BNE v
+    LDA #0 : LDX #1 : JSR osb : STX machine     \ 0 Electron, 1 B, 2 B+, 3 Master...
+    LDA #&EA : LDX #0 : LDY #&FF : JSR OSBYTE : STX tube   \ &FF: a Tube co-processor is present
+    LDA #22 : JSR OSWRCH : LDA #7 : JSR OSWRCH
     JSR init_squares
     LDA #DEFAULT_T : STA tidx : LDA #DEFAULT_K : STA kidx
     JSR settings
-    LDA #0 : STA paused : STA ratel : STA rateh : STA qlen : STA histn : STA plen
+    LDA #0 : STA histn
+    LDA #&FF : STA cur_model           \ first time: the menu counts down to the default
+.^menu_entry
+    LDX savesp : TXS
+    LDA #26 : JSR OSWRCH
+    VDUS v_curoff
+    LDA #LO(s_menufile) : STA ZA : LDA #HI(s_menufile) : STA ZB : JSR load_file
+    JSR MODEL                          \ the menu overlay: returns the model number, &FF = quit
+    CMP #&FF : BNE go : JMP quit
+.go STA cur_model
+    JSR load_model
+    LDA #0 : STA paused : STA ratel : STA rateh : STA qlen : STA qpos : STA plen
     JSR draw_screen
     JSR new_sample
 .loop
@@ -868,13 +890,13 @@ ENDMACRO
     LDX #1 : STX want_lu
     JSR step
     JSR rate_tick
-    JSR status
+    JSR status_rate
     JMP loop
 }
 
-\ emit: the test harness watches this address (A = sampled token)
+\ emit: the test harness watches this (A = sampled token)
 .emit
-    LDX histn : STA hist,X : INC histn
+    PHA : LDA histn : AND #63 : TAX : PLA : STA hist,X : INC histn
     RTS
 
 .settings
@@ -893,6 +915,7 @@ ENDMACRO
     CMP #'K' : BEQ kk
     CMP #'P' : BEQ pp
     CMP #'Q' : BEQ qq
+    CMP #'M' : BEQ mm
     CPX #27 : BEQ qq
     RTS
 .td LDA tidx : BEQ s : DEC tidx : JMP s
@@ -901,18 +924,21 @@ ENDMACRO
 .s  JSR settings : JMP status
 .pp LDA paused : EOR #1 : STA paused : JMP status
 .qq JMP quit
+.mm JMP menu_entry
 }
 
 \ new_sample: clear the window, reset the model, reseed, queue newline + prompt
 .new_sample
 {
-    JSR clear_window
-    JSR cursor_on
+    LDA #12 : JSR OSWRCH                \ clears the text window
+    LDA #0 : STA ccol : STA wordlen : STA endsent
+    LDA #1 : STA capnext
     LDA #0 : STA posl : STA posh : STA qpos
     LDA testseed : ORA testseed+1 : BEQ hw
     LDA testseed : STA rngl : LDA testseed+1 : STA rngh : JMP sd
-.hw LDA &FE44 : EOR &FE64 : STA rngl
-    LDA &FE45 : EOR &FE65 : EOR clk : STA rngh
+.hw LDA #&96 : LDX #&44 : JSR OSBYTE : STY rngl     \ system VIA timer 1 (works across the Tube)
+    LDA #&96 : LDX #&64 : JSR OSBYTE : TYA : EOR rngl : STA rngl
+    LDA #&96 : LDX #&45 : JSR OSBYTE : TYA : EOR clk : STA rngh
     ORA rngl : BNE sd : INC rngl
 .sd LDA #0 : STA queue                  \ token 0 = newline
     LDX plen : INX : STX qlen
@@ -920,42 +946,95 @@ ENDMACRO
 .cp CPX plen : BEQ d
     LDA ptok,X : STA queue+1,X : INX : BNE cp
 .d  LDA #0 : STA ratel : STA rateh
-    JSR status
-    RTS
+    JMP status
 }
 
 \ prompt: read a line on row 23, then start a new sample from it
 PMAX = 36
 .prompt
 {
-    SHOWSTR 23, 0, s_prompt
+    JSR full_screen
+    LDX #0 : LDY #23 : JSR tab : SHOW s_prompt
+    LDX #3 : LDY #23 : JSR tab
     LDA #0 : STA plen
-.l  LDA plen : CLC : ADC #3 : TAX : LDA #CURSOR : STA SCREEN+23*40,X
-    JSR OSRDCH
+.l  JSR OSRDCH
     CMP #13 : BEQ done
     CMP #27 : BEQ cancel
     CMP #127 : BEQ del
     \ map to a token
     CMP #'A' : BCC m : CMP #'Z'+1 : BCS m : ORA #&20
 .m  STA ZE
-    LDX #NV-1
+    LDX #46
 .f  LDA vocab,X : CMP ZE : BEQ fnd : DEX : BNE f    \ (token 0 = newline: not typeable)
     JMP l
 .fnd LDY plen : CPY #PMAX : BCS l
     TXA : STA ptok,Y
-    LDA plen : CLC : ADC #3 : TAX : LDA ZE : STA SCREEN+23*40,X
+    LDA ZE : JSR OSWRCH
     INC plen : JMP l
 .del LDA plen : BEQ l
-    CLC : ADC #3 : TAX : LDA #' ' : STA SCREEN+23*40,X
+    LDA #8 : JSR OSWRCH : LDA #' ' : JSR OSWRCH : LDA #8 : JSR OSWRCH
     DEC plen : JMP l
 .cancel
     LDA #&7E : LDX #0 : JSR osb         \ acknowledge escape (harmless)
     LDA #0 : STA plen
-    JSR show_msg_idle : RTS
+    JSR show_idle : JMP text_window
 .done
-    JSR show_msg_idle
+    JSR show_idle
+    SHOW v_window
     JSR new_sample
     LDA #0 : STA plen                   \ the prompt is used once
+    RTS
+}
+
+\ load_file: load the file named at (ZA,ZB) to MODEL
+.load_file
+    LDA ZA : STA osf : LDA ZB : STA osf+1
+    LDA #LO(MODEL) : STA osf+2 : LDA #HI(MODEL) : STA osf+3
+    LDA #ADDRHI : STA osf+4 : STA osf+5
+    LDA #0 : STA osf+6
+    LDA #&FF : LDX #LO(osf) : LDY #HI(osf) : JMP OSFILE
+
+\ add MODEL to the word at (ZA),Y; Y += 2
+.reloc
+    LDA (ZA),Y : CLC : ADC #LO(MODEL) : STA (ZA),Y : INY
+    LDA (ZA),Y : ADC #HI(MODEL) : STA (ZA),Y : INY
+    RTS
+\ (ZC,ZD) += 8 * CTX
+.cache_next
+    LDA m_ctx : STA ZE : LDA #0 : STA TL
+    ASL ZE : ROL TL : ASL ZE : ROL TL : ASL ZE : ROL TL
+    LDA ZC : CLC : ADC ZE : STA ZC : LDA ZD : ADC TL : STA ZD
+    RTS
+
+\ load_model: load M<A> and set the engine up for its shape
+.load_model
+{
+    CLC : ADC #'0' : STA fname+1
+    LDA #LO(fname) : STA ZA : LDA #HI(fname) : STA ZB : JSR load_file
+    LDX #8
+.h  LDA MODEL,X : STA m_d,X : DEX : BPL h
+    LDA #LO(MODEL) : STA ZA : LDA #HI(MODEL) : STA ZB
+    LDY #10 : JSR reloc : LDY #12 : JSR reloc : JSR reloc : JSR reloc : JSR reloc
+    LDA MODEL+10 : STA ZC : LDA MODEL+11 : STA ZD        \ the KV cache goes after the model
+    LDX #1
+.w  LDA MODEL+12,X : STA m_embp,X : LDA MODEL+14,X : STA m_outw,X : LDA MODEL+16,X : STA m_outb,X
+    DEX : BPL w
+    LDA MODEL+18 : SEC : SBC #64 : STA nm_rtab+1 : LDA MODEL+19 : SBC #0 : STA nm_rtab+2
+    \ layer table: relocate the 9 pointers, give each layer its slice of the KV cache
+    LDA #LO(MODEL+20) : STA ZA : LDA #HI(MODEL+20) : STA ZB
+    LDX m_nl
+.ly LDY #0
+.lr JSR reloc : CPY #18 : BNE lr
+    LDA ZC : STA (ZA),Y : INY : LDA ZD : STA (ZA),Y : INY : JSR cache_next
+    LDA ZC : STA (ZA),Y : INY : LDA ZD : STA (ZA),Y : JSR cache_next
+    LDA ZA : CLC : ADC #30 : STA ZA : BCC ln : INC ZB
+.ln DEX : BNE ly
+    \ derived sizes
+    LDX m_d : DEX : STX dm1
+    LDA m_d : LSR A : LSR A : LSR A : STA m_nh
+    LDA m_d : CLC : ADC #8 : STA dp8 : ADC #8 : STA dp16
+    LDX m_nv : DEX : STX nvm1
+    LDX m_ctx : DEX : STX ctxm1
     RTS
 }
 
@@ -966,32 +1045,24 @@ PMAX = 36
     LDA #18 : LDX #0 : JSR osb          \ clear soft keys (their buffer held the multiply table)
 .wk LDA #&7A : JSR OSBYTE : CPX #&FF : BNE wk   \ wait for Q / ESCAPE to be let go
     LDA #15 : LDX #1 : JSR osb          \ then flush the keyboard buffer
-    LDX #&7F
-.rs LDA zsave,X : STA &00,X : DEX : BPL rs
-    \ leave BASIC an empty program at PAGE (our code overwrote it)
-    LDA #&0D : STA &1900 : LDA #&FF : STA &1901
-    LDA #&02 : STA &12 : STA &00 : STA &02
-    LDA #&19 : STA &13 : STA &01 : STA &03
     LDA #22 : JSR OSWRCH : LDA #7 : JSR OSWRCH
-    LDX savesp : TXS
-    RTS
+    \ our code and models overwrote BASIC's program, its stack (and in a second
+    \ processor its own copy at &8000), so ask the MOS for a fresh BASIC
+IF PARASITE
+    LDA #&0D : STA &0800 : LDA #&FF : STA &0801
+ELSE
+    LDA #&0D : STA &1900 : LDA #&FF : STA &1901
+ENDIF
+    LDX #LO(s_basic) : LDY #HI(s_basic) : JMP OSCLI
 }
 
 \ ============================================================================
 \  data
 \ ============================================================================
-.vdu_init
-    EQUB 22, 7                          \ MODE 7
-    EQUB 23, 1, 0, 0, 0, 0, 0, 0, 0, 0  \ cursor off
-.vdu_init_end
-
-.rowlo
-FOR r, 0, 24 : EQUB LO(SCREEN + r * 40) : NEXT
-.rowhi
-FOR r, 0, 24 : EQUB HI(SCREEN + r * 40) : NEXT
-
 .vocab EQUB 10 : EQUS " abcdefghijklmnopqrstuvwxyz.,'", 34, "-;:!?0123456789"
-ASSERT P% - vocab = NV
+ASSERT P% - vocab = 47
+.exptab EQUB 127,112,99,87,77,68,60,53,47,41,36,32,28,25,22,19,17,15,13,12,10,9,8,7,6,6,5,4,4,3,3,3
+        EQUB 2,2,2,2,1,1,1,1,1,1,1,1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
 
 \ temperatures 0.3 .. 1.5 as kt = 16 / T
 NTEMPS = 10 : DEFAULT_T = 4
@@ -1004,33 +1075,46 @@ NTOPK = 6 : DEFAULT_K = 4
 .kstr1 EQUS "-13500"
 
 .testseed EQUW 0                        \ non-zero: fixed seed (test harness)
-
-.model
-INCBIN "../build/model.bin"
-INCLUDE "../build/model_data.6502"
-.end_of_file
+.fname EQUS "M0", 13
+IF PARASITE
+.s_menufile EQUS "MENUP", 13
+ELSE
+.s_menufile EQUS "MENU", 13
+ENDIF
+.s_basic EQUS "BASIC", 13
+.end_of_code
 
 \ ---- uninitialised data
-.zsave  SKIP 128
-.RL SKIP D : .RH SKIP D
-.X8 SKIP D
-.QB SKIP D : .KB SKIP HD : .VB SKIP HD
-.OB SKIP D
-.HB SKIP FF
-.LU SKIP NV
+IF PARASITE
+    DMAX = 64 : FMAX = 128
+    ALIGN &100
+.ACCL SKIP 128 : .ACCH SKIP 128         \ page-aligned: no page-crossing cycles
+ELSE
+    DMAX = 48 : FMAX = 64
+ENDIF
+.RL SKIP DMAX : .RH SKIP DMAX
+.X8 SKIP DMAX
+.QB SKIP DMAX : .KB SKIP HD : .VB SKIP HD
+.OB SKIP DMAX
+.HB SKIP FMAX
+.LU SKIP 48
 .EB SKIP 64
-.KEEP SKIP NV
+.KEEP SKIP 48
 .NACC SKIP 3 * HD
-.kcache SKIP NL * HD * CTX
-.vcache SKIP NL * HD * CTX
 .queue SKIP PMAX + 2
 .ptok SKIP PMAX + 2
 .wordbuf SKIP 40
+.mname SKIP 21
+.osf SKIP 18
 .clk SKIP 5
+.m_d SKIP 1 : .m_nl SKIP 1 : .m_ff SKIP 1 : .m_ctx SKIP 1 : .m_nv SKIP 1 : .m_nk SKIP 1 : .m_emb SKIP 1 : .m_sl SKIP 1 : .m_ctxb SKIP 1
+.m_embp SKIP 2 : .m_outw SKIP 2 : .m_outb SKIP 2
+.dm1 SKIP 1 : .m_nh SKIP 1 : .dp8 SKIP 1 : .dp16 SKIP 1 : .nvm1 SKIP 1 : .ctxm1 SKIP 1
 .ly_qkv_w SKIP 2 : .ly_qkv_b SKIP 2 : .ly_o_w SKIP 2 : .ly_o_b SKIP 2
 .ly_f1_w SKIP 2 : .ly_f1_b SKIP 2 : .ly_f2_w SKIP 2 : .ly_f2_b SKIP 2 : .ly_rb SKIP 2
 .ly_kc SKIP 2 : .ly_vc SKIP 2
 .ly_sq SKIP 1 : .ly_sk SKIP 1 : .ly_sv SKIP 1 : .ly_so SKIP 1 : .ly_s1 SKIP 1 : .ly_s2 SKIP 1 : .ly_sqk SKIP 1 : .ly_pad SKIP 1
+LAYER_TAB_SIZE = 30
 .mv_w SKIP 2 : .mv_b SKIP 2 : .mv_x SKIP 2 : .mv_rows SKIP 1 : .mv_cols SKIP 1 : .mv_j SKIP 1
 .rq_lo SKIP 1 : .rq_src SKIP 1 : .rq_n SKIP 1 : .rq_s SKIP 1 : .rq_dst SKIP 2 : .rq_i SKIP 1
 .rs SKIP 1
@@ -1041,20 +1125,192 @@ INCLUDE "../build/model_data.6502"
 .tok SKIP 1 : .slot SKIP 1 : .nvis SKIP 1 : .posl SKIP 1 : .posh SKIP 1 : .layer SKIP 1 : .ltp SKIP 2
 .want_lu SKIP 1 : .kt SKIP 1 : .topk SKIP 1 : .rngl SKIP 1 : .rngh SKIP 1
 .tidx SKIP 1 : .kidx SKIP 1 : .paused SKIP 1 : .qpos SKIP 1 : .qlen SKIP 1 : .plen SKIP 1
-.crow SKIP 1 : .ccol SKIP 1 : .wordlen SKIP 1 : .capnext SKIP 1 : .endsent SKIP 1
+.ccol SKIP 1 : .wordlen SKIP 1 : .capnext SKIP 1 : .endsent SKIP 1 : .savex SKIP 1 : .savey SKIP 1
 .t0 SKIP 2 : .ntok SKIP 1 : .dvl SKIP 1 : .dvh SKIP 1 : .ratel SKIP 1 : .rateh SKIP 1
+.machine SKIP 1 : .tube SKIP 1 : .cur_model SKIP 1
 .histn SKIP 1
 .savesp SKIP 1
-.hist SKIP 256
+.hist SKIP 64                          \ ring of the last 64 tokens (test harness)
 .end_of_bss
+MODEL = end_of_bss                      \ models (and the menu overlay) load here
+FREE = MEMTOP - MODEL
 
-PRINT "code+tables", ~start, "-", ~model, "(", model - start, "bytes )"
-PRINT "model      ", ~model, "-", ~end_of_file, "(", end_of_file - model, "bytes )"
-PRINT "bss        ", ~end_of_file, "-", ~end_of_bss, "(", end_of_bss - end_of_file, "bytes )"
-PRINT "free       ", &7C00 - end_of_bss, "bytes"
+\ ============================================================================
+\  boot menu overlay: loaded at MODEL, overwritten by the model it picks
+\    in:  cur_model (&FF at boot: count down and start the default)
+\    out: A = model number, or &FF to quit; mname = the model's title
+\ ============================================================================
+ORG MODEL
+.menu_start
+{
+    LDA #22 : JSR OSWRCH : LDA #7 : JSR OSWRCH
+    VDUS v_curoff
+    SHOW s_title : JSR OSNL : SHOW s_title : JSR OSNL
+    \ ---- what we're running on
+    LDX #0 : LDY #3 : JSR tab : SHOW m_comp
+    LDX machine : CPX #6 : BCC mk : LDX #6
+.mk LDA mach_lo,X : STA ZA : LDA mach_hi,X : STA ZB : JSR prstr
+    LDX #0 : LDY #4 : JSR tab : SHOW m_tube
+    LDA tube : BEQ nt
+    SHOW m_tube_yes : JMP t1
+.nt SHOW m_tube_no
+.t1 LDX #0 : LDY #5 : JSR tab : SHOW m_run
+    LDX #0 : LDY #7 : JSR tab : SHOW m_head
+    LDX #0 : LDY #16 : JSR tab : SHOW m_keys
+    LDX #0 : LDY #20 : JSR tab : SHOW m_note
+    LDX #0 : LDY #22 : JSR tab : SHOW m_quit
+    \ ---- which models fit (RAM and accumulator rows)
+    LDX #NMODELS-1
+.ft TXA : ASL A : TAY
+    LDA #0 : STA fits,X
+    LDA #LO(FREE) : CMP cat_need,Y : LDA #HI(FREE) : SBC cat_need+1,Y : BCC nf
+    LDA #MAXROWS : CMP cat_rows,X : BCC nf
+    LDA #1 : STA fits,X
+.nf DEX : BPL ft
+    \ ---- default: the one we came from, else the biggest that fits and runs >= 1 char/s
+    LDA #0 : STA count
+    LDX cur_model : BMI auto
+    LDA fits,X : BNE have
+.auto
+    LDA #5 : STA count
+    LDX #NMODELS-1
+.a1 LDA fits,X : BEQ a2
+    TXA : ASL A : TAY
+    LDA cps+1,Y : BNE have : LDA cps,Y : CMP #100 : BCS have
+.a2 DEX : BPL a1
+    LDX #NMODELS-1                      \ none that fast: the biggest that fits
+.a3 LDA fits,X : BNE have : DEX : BPL a3
+    INX
+.have STX sel
+.redraw
+    JSR rows
+.wait
+    LDA count : BEQ nocount
+    LDX #1 : LDY #18 : JSR tab : SHOW m_start
+    LDA count : ORA #'0' : JSR OSWRCH : LDA #' ' : JSR OSWRCH
+.nocount
+    LDA #&81 : LDX #100 : LDY #0 : JSR OSBYTE    \ wait up to a second for a key
+    CPY #0 : BEQ gotkey
+    LDA count : BEQ wait
+    DEC count : BNE wait
+    JMP start
+.gotkey
+    STX ZE
+    LDA count : BEQ k0
+    LDA #0 : STA count
+    LDX #1 : LDY #18 : JSR tab : SHOW m_blank
+.k0 LDA ZE
+    CMP #13 : BEQ start : CMP #' ' : BEQ start
+    CMP #139 : BEQ up : CMP #138 : BEQ down
+    CMP #27 : BEQ quitm
+    CMP #'1' : BCC k1 : CMP #'1'+NMODELS : BCS k1
+    SBC #'1'-1 : TAX                      \ (carry clear: subtract one more)
+    LDA fits,X : BEQ w2 : STX sel : JMP redraw
+.k1 AND #&DF : CMP #'Q' : BEQ quitm
+    JMP wait
+.w2 JMP wait
+.up LDX sel
+.u1 DEX : BMI w2 : LDA fits,X : BEQ u1 : STX sel : JMP redraw
+.down LDX sel
+.d1 INX : CPX #NMODELS : BEQ w2 : LDA fits,X : BEQ d1 : STX sel : JMP redraw
+.quitm
+    LDA #&FF : RTS
+.start
+    \ title for the main screen
+    LDA sel : ASL A : ASL A : STA ZC : ASL A : ASL A : CLC : ADC ZC : TAY   \ * 20
+    LDX #0
+.cn LDA cat_name,Y : STA mname,X : INY : INX : CPX #20 : BNE cn
+    LDA #0 : STA mname+20
+    LDA sel : RTS
 
-SAVE "LLM", start, end_of_file, main
+\ ---- draw the model rows (9, 10, 11, 12 ...)
+.rows
+    LDA #0 : STA row
+.r0 LDX #0 : LDA row : CLC : ADC #9 : TAY : JSR tab
+    LDX row
+    LDA #&9C : LDY #&87                  \ black background, white text
+    CPX sel : BNE r1 : LDA #&83 : LDY #&9D \ yellow bar ...
+.r1 JSR OSWRCH : TYA : JSR OSWRCH
+    LDX row : LDA #&84 : CPX sel : BEQ r2   \ ... with blue text
+    LDA fits,X : BNE r3 : LDA #&84 : BNE r2  \ blue ("grey") if it can't run here
+.r3 LDA #' '
+.r2 JSR OSWRCH
+    LDA row : CLC : ADC #'1' : JSR OSWRCH : LDA #' ' : JSR OSWRCH
+    \ name, params, RAM
+    LDA row : ASL A : STA ZC : ASL A : ASL A : ASL A : CLC : ADC ZC : TAY  \ * 18
+    LDX #18
+.tx LDA cat_text,Y : JSR OSWRCH : INY : DEX : BNE tx
+    LDA #' ' : JSR OSWRCH
+    \ speed
+    LDX row : LDA fits,X : BEQ nosp
+    TXA : ASL A : TAY
+    LDA cps,Y : STA n0 : LDA cps+1,Y : STA n1
+    LDX #0 : JSR digit
+    LDX #1 : JSR digit : JSR OSWRCH : LDA #'.' : JSR OSWRCH
+    LDX #2 : JSR digit : JSR OSWRCH : LDX #3 : JSR digit : JSR OSWRCH
+    SHOW m_fits : JMP rn
+.nosp SHOW m_nofit
+.rn LDA #&9C : JSR OSWRCH
+    INC row : LDA row : CMP #NMODELS : BEQ rx : JMP r0
+.rx
+    RTS
+
+.mach_lo EQUB LO(m_elk), LO(m_b), LO(m_bp), LO(m_m128), LO(m_met), LO(m_mc), LO(m_other)
+.mach_hi EQUB HI(m_elk), HI(m_b), HI(m_bp), HI(m_m128), HI(m_met), HI(m_mc), HI(m_other)
+.m_elk EQUS "Acorn Electron", 0
+.m_b   EQUS "BBC Micro Model B", 0
+.m_bp  EQUS "BBC Micro B+", 0
+.m_m128 EQUS "BBC Master 128", 0
+.m_met EQUS "BBC Master ET", 0
+.m_mc  EQUS "BBC Master Compact", 0
+.m_other EQUS "BBC Micro", 0
+.m_comp EQUB &86 : EQUS "Computer ", &87, 0
+.m_tube EQUB &86 : EQUS "Tube     ", &87, 0
+.m_tube_yes EQUS "6502 Second Processor", 0
+.m_tube_no EQUS "no second processor", 0
+IF PARASITE
+.m_run EQUB &86 : EQUS "Running  ", &87 : EQUS "in the 2P, ", STR$(FREE), " bytes free", 0
+.m_note EQUS " ", 0
+ELSE
+.m_run EQUB &86 : EQUS "Running  ", &87 : EQUS "in the B, ", STR$(FREE), " bytes free", 0
+.m_note EQUB &84 : EQUS "Blue: needs a 6502 Second Processor", 0
+ENDIF
+.m_head EQUB &83 : EQUS "    Model  Params  RAM char/s", 0
+.m_keys EQUB &86 : EQUS "1-", '0' + NMODELS, " or cursor keys, RETURN to start", 0
+.m_quit EQUB &86 : EQUS "Q", &87 : EQUS "quit to BASIC", 0
+.m_start EQUB &82 : EQUS "Starting in ", 0
+.m_blank EQUS "                ", 0
+.m_fits EQUS "  ok   ", 0
+IF PARASITE
+.m_nofit EQUS " --  no room", 0
+ELSE
+.m_nofit EQUS " --  2P only", 0
+ENDIF
+}
+INCLUDE "../build/catalog.6502"
+.fits SKIP NMODELS
+.sel SKIP 1
+.count SKIP 1
+.row SKIP 1
+IF PARASITE
+cps = cat_cps_p
+ELSE
+cps = cat_cps_b
+ENDIF
+.menu_end
+PRINT "code       ", ~start, "-", ~end_of_code, "(", end_of_code - start, "bytes )"
+PRINT "bss        ", ~end_of_code, "-", ~end_of_bss, "(", end_of_bss - end_of_code, "bytes )"
+PRINT "model area ", ~MODEL, "-", ~MEMTOP, "(", FREE, "bytes )"
+PRINT "menu       ", ~menu_start, "-", ~menu_end
+IF PARASITE
+SAVE "LLMP", start, end_of_code, main
+SAVE "MENUP", menu_start, menu_end
+ELSE
+SAVE "LLM", start, end_of_code, &FF0000 + main, &FF0000 + start
+SAVE "MENU", menu_start, menu_end, &FF0000 + menu_start, &FF0000 + menu_start
 PUTTEXT "boot.txt", "!BOOT", 0
+INCLUDE "../build/putfiles.6502"
+ENDIF
 \ symbols for the test harness
 PRINT "SYM emit", ~emit
 PRINT "SYM step", ~step
@@ -1070,9 +1326,6 @@ PRINT "SYM hist", ~hist
 PRINT "SYM posl", ~posl
 PRINT "SYM RL", ~RL
 PRINT "SYM X8", ~X8
-PRINT "SYM QB", ~QB
-PRINT "SYM OB", ~OB
-PRINT "SYM HB", ~HB
 PRINT "SYM norm", ~norm
 PRINT "SYM attention", ~attention
 PRINT "SYM matvec", ~matvec
@@ -1085,10 +1338,13 @@ PRINT "SYM asr", ~asr
 PRINT "SYM clamp", ~clamp
 PRINT "SYM sdiv", ~sdiv
 PRINT "SYM putc", ~putc
-PRINT "SYM status", ~status
+PRINT "SYM status_rate", ~status_rate
 PRINT "SYM rate_tick", ~rate_tick
-PRINT "SYM read_clock", ~read_clock
-PRINT "SYM print_at", ~print_at
-PRINT "SYM digit", ~digit
 PRINT "SYM rng", ~rng
 PRINT "SYM loop", ~main_loop
+PRINT "SYM menu", ~menu_start
+PRINT "SYM cur_model", ~cur_model
+PRINT "SYM load_model", ~load_model
+PRINT "SYM MODEL", ~MODEL
+PRINT "SYM tube", ~tube
+PRINT "SYM machine", ~machine

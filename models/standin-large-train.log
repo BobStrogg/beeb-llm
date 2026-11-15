@@ -1,0 +1,26 @@
+corpus 728018 symbols, model 49679 params, cfg {'d': 48, 'H': 6, 'L': 3, 'F': 96, 'T': 32, 'V': 47, 'hd': 8}
+float training
+  float     0 loss 5.680 bpc  val 5.701 bpc  0s
+  float  1000 loss 2.281 bpc  val 2.339 bpc  30s
+  float  2000 loss 2.176 bpc  val 2.230 bpc  62s
+  float  3000 loss 2.073 bpc  val 2.174 bpc  95s
+  float  4000 loss 2.043 bpc  val 2.159 bpc  126s
+  float  5000 loss 1.990 bpc  val 2.135 bpc  158s
+  float  6000 loss 2.015 bpc  val 2.102 bpc  187s
+  float  7000 loss 2.035 bpc  val 2.092 bpc  218s
+  float  8000 loss 1.964 bpc  val 2.074 bpc  248s
+  float  9000 loss 1.964 bpc  val 2.064 bpc  279s
+  float 10000 loss 1.931 bpc  val 2.060 bpc  308s
+  float 11000 loss 1.898 bpc  val 2.045 bpc  337s
+  float 12000 loss 1.854 bpc  val 2.042 bpc  367s
+  float 13000 loss 1.956 bpc  val 2.034 bpc  397s
+  float 13999 loss 1.926 bpc  val 2.033 bpc  427s
+scales {"ar": 7, "l0": {"aq": 5, "ak": 6, "av": 5, "ah": 4}, "l1": {"aq": 5, "ak": 5, "av": 5, "ah": 5}, "l2": {"aq": 5, "ak": 5, "av": 5, "ah": 4}} rmax 37.35
+weight-bit caps {"emb": 99, "l0.wq": 7, "l0.wk": 8, "l0.wv": 7, "l0.wo": 7, "l0.w1": 6, "l0.w2": 6, "l1.wq": 6, "l1.wk": 7, "l1.wv": 7, "l1.wo": 6, "l1.w1": 5, "l1.w2": 6, "l2.wq": 6, "l2.wk": 7, "l2.wv": 7, "l2.wo": 6, "l2.w1": 5, "l2.w2": 5, "out": 4}
+QAT
+  qat     0 loss 1.948 bpc  val 2.079 bpc  1s
+  qat  1000 loss 1.931 bpc  val 2.072 bpc  113s
+  qat  2000 loss 1.938 bpc  val 2.052 bpc  193s
+  qat  2999 loss 1.883 bpc  val 2.052 bpc  269s
+val bpc: float 2.033  qat 2.052
+wrote build/final/large.npz
